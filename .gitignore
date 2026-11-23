@@ -1,0 +1,7 @@
+# hasil build Rust
+/target/
+*.pdb
+
+# editor
+.vscode/
+.idea/
