@@ -2,6 +2,20 @@
 
 A lightweight liquid-glass dock that replaces the Windows 11 taskbar, written in Rust with plain Win32 + Direct2D (no web view, no framework).
 
+![GlassDock with the Start menu open](docs/screenshots/overview.png)
+
+## Screenshots
+
+| Control Center | Calendar |
+| :---: | :---: |
+| ![Control Center](docs/screenshots/control-center.png) | ![Calendar](docs/screenshots/calendar.png) |
+
+**Dock**: pinned and running apps, Wi-Fi icon inside the battery ring, clock
+
+![Dock](docs/screenshots/dock.png)
+
+## Features
+
 - **Centered glass dock** at the bottom of the screen: pinned and running apps, open/active indicators, auto-hide (slides up when the cursor reaches the bottom middle of the screen).
 - **iPhone-style status**: Wi-Fi icon inside a battery ring, battery percentage underneath, `HH:mm` clock and date.
 - **Glass panels** that open above the dock with a fade/slide animation and a blurred background:
