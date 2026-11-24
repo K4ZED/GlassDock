@@ -60,7 +60,7 @@ The dock only offers releases whose tag is newer than its own version and that i
 
 ## Requirements (to build from source)
 
-- Windows 11 (Windows 10 mostly works, but is untested)
+- Windows 10/11
 - [Rust](https://rustup.rs) (stable, MSVC toolchain)
 - Visual Studio Build Tools with the **Desktop development with C++** workload (for `link.exe` and the Windows SDK)
 
