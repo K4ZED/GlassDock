@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 //  Panel kaca yang muncul di atas dock:
 //   - Control Center (klik lingkaran Wi-Fi/baterai) - tata letak ala iOS
 //   - Calendar       (klik jam)
@@ -10,10 +10,10 @@
 // ============================================================
 
 use super::*;
-use std::{cell::Cell, collections::HashMap, ffi::c_void, sync::mpsc, time::Instant};
+use std::{cell::Cell, collections::HashMap, ffi::c_void, sync::mpsc};
 use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::System::{
-    Power::{GetSystemPowerStatus, SetSuspendState, SYSTEM_POWER_STATUS},
+    Power::SetSuspendState,
     Shutdown::LockWorkStation,
     Threading::{AttachThreadInput, GetCurrentThreadId},
 };
@@ -26,10 +26,31 @@ const ANIM_TIMER: usize = 1;
 const BLUE: u32 = 0x0A84FF;
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum PanelKind { Control, Calendar, Start }
+pub enum PanelKind { Control, Calendar, Start, Menu }
+
+// ---------- menu klik kanan dock (kaca) ----------
+pub const MENU_W: f32 = 264.0;
+const MENU_PAD: f32 = 7.0;
+const MENU_R: f32 = 16.0;
+
+#[derive(Clone)]
+pub enum MenuItem {
+    /// baris biasa; `id` = perintah (lihat App::run_menu_cmd)
+    Action { id: u32, glyph: &'static str, label: String, enabled: bool },
+    /// tombol segmen ala iOS; perintah = `id + nomor pilihan`
+    Segmented { id: u32, title: &'static str, options: [&'static str; 3], selected: usize },
+    /// saklar on/off
+    Toggle { id: u32, glyph: &'static str, label: &'static str, on: bool },
+    Sep,
+}
+
+fn menu_item_h(it: &MenuItem) -> f32 {
+    match it { MenuItem::Action { .. } => 34.0, MenuItem::Toggle { .. } => 38.0, MenuItem::Segmented { .. } => 60.0, MenuItem::Sep => 9.0 }
+}
+pub fn menu_height(items: &[MenuItem]) -> f32 { MENU_PAD * 2.0 + items.iter().map(menu_item_h).sum::<f32>() }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum PHit { Conn(u8), BatteryModule, Tile(u8), VBright, VVol, Btn(u8), Prev, Next, App(usize), Power }
+pub enum PHit { Conn(u8), Tile(u8), VBright, VVol, Memory, Btn(u8), Prev, Next, App(usize), Power, PowerAct(u8), PowerCancel, MenuRow(u8), MenuSeg(u8, u8) }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Slider { Volume, Bright }
@@ -49,9 +70,12 @@ pub struct Panel {
     pending: Cell<bool>,
     anim: f32,
     closing: bool,
+    power: bool,      // kartu power kaca sedang tampil di atas isi panel
+    power_anim: f32,  // 0..1 animasi muncul kartu power
     bg: Option<(u32, u32, Vec<u8>)>,
     bg_bmp: Option<ID2D1Bitmap>,
     f_title: IDWriteTextFormat,
+    f_menu: IDWriteTextFormat,
     f_text: IDWriteTextFormat,
     f_small: IDWriteTextFormat,
     f_name: IDWriteTextFormat,
@@ -137,11 +161,14 @@ fn box_blur(buf: &mut [f32], w: usize, h: usize, r: usize) {
 
 /// Ambil layar di belakang panel, perkecil 4x, buramkan, pertajam warna (efek kaca iPhone).
 /// Hasil: gambar kecil BGRA yang nanti diperbesar halus saat digambar.
-fn capture_blur(x: i32, y: i32, w: i32, h: i32) -> Option<(u32, u32, Vec<u8>)> {
+pub(crate) fn capture_blur(x: i32, y: i32, w: i32, h: i32) -> Option<(u32, u32, Vec<u8>)> { capture_blur_ex(x, y, w, h, true) }
+
+/// `layered = false`: jendela layered (dock & panel GlassDock sendiri) tidak ikut terekam
+pub(crate) fn capture_blur_ex(x: i32, y: i32, w: i32, h: i32, layered: bool) -> Option<(u32, u32, Vec<u8>)> {
     unsafe {
         let surf = Surface::new(w, h)?;
         let screen = GetDC(None);
-        let ok = BitBlt(surf.dc, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT).is_ok();
+        let ok = BitBlt(surf.dc, 0, 0, w, h, screen, x, y, if layered { SRCCOPY | CAPTUREBLT } else { SRCCOPY }).is_ok();
         ReleaseDC(None, screen);
         if !ok || surf.bits.is_null() { return None; }
         let src = std::slice::from_raw_parts(surf.bits, (w * h * 4) as usize);
@@ -205,7 +232,7 @@ fn force_foreground(hwnd: HWND) {
 
 // ---------- posisi elemen Control Center (DIP) ----------
 const CC_W: f32 = 316.0;
-const CC_H: f32 = 390.0;
+const CC_H: f32 = 572.0;
 fn cc_bright_rect() -> D2D_RECT_F { rc(164.0, 164.0, 226.0, 300.0) }
 fn cc_vol_rect() -> D2D_RECT_F { rc(238.0, 164.0, 300.0, 300.0) }
 
@@ -238,6 +265,44 @@ impl App {
         });
         self.bright_tx = Some(cmd_tx);
         self.bright_rx = Some(val_rx);
+        // saklar Wi-Fi/Bluetooth langsung + status Battery saver yang selalu sinkron
+        let (rtx, rrx) = sys::spawn_radio_worker(notify, WM_APP_RADIO);
+        self.radio_tx = Some(rtx);
+        self.radio_rx = Some(rrx);
+        sys::watch_power_mode(notify, WM_APP_POWER);
+    }
+
+    pub fn on_radios(&mut self) {
+        if let Some(rx) = &self.radio_rx {
+            for v in rx.try_iter() { self.radios = v; }
+        }
+        self.panel_invalidate();
+    }
+
+    /// Kirim perintah ke thread radio dan langsung ubah tampilan (status asli menyusul dari thread)
+    fn toggle_radio(&mut self, cmd: sys::RadioCmd) {
+        let Some(tx) = &self.radio_tx else { return };
+        if tx.send(cmd).is_err() { return; }
+        let r = &mut self.radios;
+        match cmd {
+            0 => r.wifi = r.wifi.map(|v| !v),
+            1 => r.bt = r.bt.map(|v| !v),
+            _ => { let on = r.airplane(); r.wifi = r.wifi.map(|_| on); r.bt = r.bt.map(|_| on); }
+        }
+        self.panel_invalidate();
+    }
+
+    /// Battery saver langsung (Windows hanya mengizinkannya saat memakai baterai)
+    fn toggle_saver(&mut self) {
+        if self.bat.plugged || !self.bat.present { return; }
+        let on = !sys::saver_on();
+        let saved: u32 = cfg_read("saver-threshold.txt").and_then(|s| s.trim().parse().ok()).unwrap_or(20);
+        if let Some(old) = sys::set_saver(on, saved) {
+            // simpan ambang asli pengguna saat menyalakan, supaya bisa dikembalikan
+            if on && old < 100 { cfg_write("saver-threshold.txt", &old.to_string()); }
+            sys::POWER_MODE.store(if on { 0 } else { -1 }, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.panel_invalidate();
     }
 
     fn refresh_start_list(&mut self) {
@@ -296,7 +361,7 @@ impl App {
             }
             self.destroy_panel();
         }
-        let _ = self.open_panel(kind, anchor_dip);
+        if let Err(e) = self.open_panel(kind, anchor_dip) { log_line(&format!("open panel failed: {e}")); }
     }
 
     /// Tutup dengan animasi
@@ -328,10 +393,11 @@ impl App {
                 PanelKind::Control => (CC_W, CC_H),
                 PanelKind::Calendar => (300.0, 338.0),
                 PanelKind::Start => (600.0, 560.0),
+                PanelKind::Menu => (MENU_W, menu_height(&self.menu_items)),
             };
             let (pw, ph) = ((w * s).round() as i32, (h * s).round() as i32);
             // posisi: di atas dock, sejajar dengan tombol yang diklik
-            let (dx, dy, _, _) = self.geom;
+            let (dx, dy, _, _) = self.body();
             let sw = GetSystemMetrics(SM_CXSCREEN);
             let ax = dx + (anchor_dip * s).round() as i32;
             let left = (ax - pw / 2).clamp(8, sw - pw - 8);
@@ -353,9 +419,12 @@ impl App {
                 pending: Cell::new(false),
                 anim: 0.0,
                 closing: false,
-                bg: capture_blur(left, top, pw, ph), // diambil sebelum panel tampil
+                power: false,
+                power_anim: 0.0,
+                bg: self.capture_behind(left, top, pw, ph), // diambil sebelum panel tampil, tanpa dock/OSD/pemberitahuan
                 bg_bmp: None,
                 f_title: text(DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0)?,
+                f_menu: text(DWRITE_FONT_WEIGHT_NORMAL, 13.0)?,
                 f_text: text(DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.5)?,
                 f_small: text(DWRITE_FONT_WEIGHT_NORMAL, 11.0)?,
                 f_name: {
@@ -380,6 +449,10 @@ impl App {
                 scroll: 0,
                 icons: HashMap::new(),
             };
+            // baca ulang kecerahan asli di latar belakang (nilai saat dock baru menyala bisa masih nilai boot)
+            if kind == PanelKind::Control {
+                if let Some(tx) = &self.bright_tx { let _ = tx.send(-1.0); }
+            }
             let t = GetLocalTime();
             panel.today = (t.wYear as i32, t.wMonth as u32, t.wDay as u32);
             panel.month = (t.wYear as i32, t.wMonth as u32);
@@ -389,6 +462,7 @@ impl App {
                     if let Some((v, _)) = a.get() { panel.volume = v; }
                     panel.audio = Some(a);
                     panel.ssid = sys::wifi_name(&mut self.wlan);
+                    self.top_procs = sys::top_processes(3);
                     // baca ulang kecerahan (mungkin diubah lewat tombol Fn) tanpa menunggu
                     if let Some(tx) = &self.bright_tx { let _ = tx.send(-1.0); }
                 }
@@ -399,7 +473,7 @@ impl App {
                     }
                     panel.filtered = (0..panel.apps.len()).collect();
                 }
-                PanelKind::Calendar => {}
+                PanelKind::Calendar | PanelKind::Menu => {}
             }
             if kind == PanelKind::Start { self.refresh_start_list(); } // perbarui diam-diam (aplikasi baru)
 
@@ -425,14 +499,39 @@ impl App {
             p.anim -= 0.16; // ~95 ms
             if p.anim <= 0.0 { self.destroy_panel(); return; }
         } else {
-            p.anim += 0.11; // ~140 ms
-            if p.anim >= 1.0 {
-                p.anim = 1.0;
+            p.anim = (p.anim + 0.11).min(1.0); // ~140 ms
+            // kartu power: muncul / hilang halus (perlu digambar ulang tiap langkah)
+            let target = if p.power { 1.0 } else { 0.0 };
+            let power_moving = (p.power_anim - target).abs() > 0.001;
+            if power_moving {
+                p.power_anim = if p.power { (p.power_anim + 0.16).min(1.0) } else { (p.power_anim - 0.2).max(0.0) };
+                if p.power_anim < 0.01 { p.power_anim = 0.0; }
+            }
+            if p.anim >= 1.0 && !power_moving {
                 unsafe { let _ = KillTimer(p.hwnd, ANIM_TIMER); }
             }
+            if power_moving { self.panel_render(); return; }
         }
         self.panel_present();
     }
+
+    /// Volume diubah lewat tombol keyboard: geser slider Control Center yang sedang terbuka
+    pub(crate) fn sync_panel_volume(&mut self, v: f32) {
+        if let Some(p) = self.panel.as_mut() {
+            if p.kind == PanelKind::Control && p.drag.is_none() { p.volume = v; }
+        }
+        self.panel_invalidate();
+    }
+
+    pub(crate) fn sync_panel_brightness(&mut self, v: f32) {
+        if let Some(p) = self.panel.as_mut() {
+            if p.kind == PanelKind::Control && p.drag.is_none() { p.brightness = v; }
+        }
+        self.panel_invalidate();
+    }
+
+    /// Minta panel digambar ulang (dipakai dock untuk memperbarui grafik RAM)
+    pub(crate) fn refresh_panel(&self) { self.panel_invalidate(); }
 
     fn panel_invalidate(&self) {
         if let Some(p) = &self.panel {
@@ -513,7 +612,8 @@ impl App {
 
             rt.BeginDraw();
             rt.Clear(Some(&col(0.0, 0.0, 0.0, 0.0)));
-            let body = rrect(rc(0.0, 0.0, w, h), PANEL_R);
+            let pr = if kind == PanelKind::Menu { MENU_R } else { PANEL_R }; // menu: sudut lebih kecil
+            let body = rrect(rc(0.0, 0.0, w, h), pr);
             // latar buram (diperbesar halus dari gambar kecil), sudut anti-aliased
             match bg {
                 Some((bmp, (bw, bh))) => {
@@ -533,14 +633,17 @@ impl App {
             // lapisan gelap tipis agar teks putih terbaca, lalu lapisan kaca
             br.SetColor(&col(0.05, 0.05, 0.07, 0.42));
             rt.FillRoundedRectangle(&body, &br);
-            draw_glass(&rt, &br, w, h, PANEL_R, &look, 0.0)?;
+            draw_glass(&rt, &br, w, h, pr, &look, 0.0)?;
 
             let mut hits = Vec::new();
             let res = match kind {
                 PanelKind::Control => self.draw_control(&rt, &br, &mut hits),
                 PanelKind::Calendar => self.draw_calendar(&rt, &br, w, &mut hits),
                 PanelKind::Start => self.draw_start_menu(&rt, &br, w, h, &mut hits),
+                PanelKind::Menu => self.draw_menu(&rt, &br, w, &mut hits),
             };
+            let power_t = self.panel.as_ref().map(|p| p.power_anim).unwrap_or(0.0);
+            let res = res.and_then(|_| if power_t > 0.0 { hits.clear(); self.draw_power_card(&rt, &br, w, h, power_t, &mut hits) } else { Ok(()) });
             let _ = rt.EndDraw(None, None);
             res?;
             if let Some(p) = self.panel.as_mut() { p.hits = hits; }
@@ -601,18 +704,20 @@ impl App {
             // --- modul konektivitas: 4 tombol bulat ---
             let m1 = rc(16.0, 16.0, 152.0, 152.0);
             self.module_bg(rt, br, m1, 26.0, false);
-            let wifi_on = matches!(self.net, Net::Wifi(_));
+            // status asli dari radio; sebelum terbaca, Wi-Fi ditebak dari koneksi
+            let wifi_on = self.radios.wifi.unwrap_or(matches!(self.net, Net::Wifi(_)));
             let blue = hex(BLUE);
-            self.circle_btn(rt, br, 50.0, 50.0, 25.0, "\u{E701}", if wifi_on { Some(blue) } else { None }, PHit::Conn(0), hits)?;
-            self.circle_btn(rt, br, 118.0, 50.0, 25.0, "\u{E702}", None, PHit::Conn(1), hits)?;
-            self.circle_btn(rt, br, 50.0, 118.0, 25.0, "\u{E709}", None, PHit::Conn(2), hits)?;
+            let on = |b: bool| if b { Some(blue) } else { None };
+            self.circle_btn(rt, br, 50.0, 50.0, 25.0, "\u{E701}", on(wifi_on), PHit::Conn(0), hits)?;
+            self.circle_btn(rt, br, 118.0, 50.0, 25.0, "\u{E702}", on(self.radios.bt == Some(true)), PHit::Conn(1), hits)?;
+            self.circle_btn(rt, br, 50.0, 118.0, 25.0, "\u{E709}", if self.radios.airplane() { Some(hex(0xFF9F0A)) } else { None }, PHit::Conn(2), hits)?;
             self.circle_btn(rt, br, 118.0, 118.0, 25.0, "\u{E774}", if self.net == Net::Ethernet { Some(blue) } else { None }, PHit::Conn(3), hits)?;
 
             // --- modul baterai: cincin besar ---
             let m2 = rc(164.0, 16.0, 300.0, 152.0);
-            self.module_bg(rt, br, m2, 26.0, self.hovered(PHit::BatteryModule));
-            hits.push((PHit::BatteryModule, m2));
-            let b = self.bat;
+            self.module_bg(rt, br, m2, 26.0, false); // hanya informasi, tidak bisa diklik
+            let mut b = self.bat;
+            b.saver = sys::saver_on();
             let (cx, cy, rr) = (232.0, 72.0, 34.0);
             let color = if !b.present { white(1.0) } else if b.plugged { hex(GREEN) } else if b.saver { hex(YELLOW) } else if b.pct <= 20 { hex(RED) } else { white(1.0) };
             let track = self.arc_path(cx, cy, rr, 225.0, 270.0)?;
@@ -630,7 +735,7 @@ impl App {
             self.ptext(rt, br, status, &p.f_small, rc(m2.left, 118.0, m2.right, 140.0), DWRITE_TEXT_ALIGNMENT_CENTER, white(0.75))?;
 
             // --- dua tile kiri: Night light & Battery saver ---
-            for (i, (title, sub, active)) in [("Night light", "Settings", false), ("Battery saver", if b.saver { "On" } else { "Off" }, b.saver)].iter().enumerate() {
+            for (i, (title, sub, active)) in [("Night light", "Open settings \u{203A}", false), ("Battery saver", if b.saver { "On" } else if b.plugged || !b.present { "Plugged in" } else { "Off" }, b.saver)].iter().enumerate() {
                 let y = 164.0 + i as f32 * 74.0;
                 let r = rc(16.0, y, 152.0, y + 62.0);
                 let hit = PHit::Tile(i as u8);
@@ -658,10 +763,75 @@ impl App {
             let vol_glyph = if p.volume < 0.005 { "\u{E74F}" } else { "\u{E767}" };
             self.vslider(rt, br, cc_vol_rect(), p.volume, vol_glyph, p.audio.as_ref().map(|a| a.get().is_some()).unwrap_or(false), PHit::VVol, hits)?;
 
+            // --- modul memori: grafik RAM 60 detik + aplikasi terbesar ---
+            self.draw_memory(rt, br, rc(16.0, 312.0, 300.0, 482.0), hits)?;
+
             // --- baris tombol bulat ---
             for (i, g) in ["\u{E713}", "\u{E722}", "\u{E72E}", "\u{E7E8}"].iter().enumerate() {
                 let cx = 16.0 + 31.0 + i as f32 * 74.0;
-                self.circle_btn(rt, br, cx, 343.0, 31.0, g, None, PHit::Btn(i as u8), hits)?;
+                self.circle_btn(rt, br, cx, 525.0, 31.0, g, None, PHit::Btn(i as u8), hits)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Modul memori ala widget iOS: persen + GB, grafik garis 60 detik, 3 aplikasi terbesar. Klik = Task Manager
+    fn draw_memory(&self, rt: &ID2D1RenderTarget, br: &ID2D1SolidColorBrush, r: D2D_RECT_F, hits: &mut Vec<(PHit, D2D_RECT_F)>) -> Result<()> {
+        unsafe {
+            let p = self.panel.as_ref().unwrap();
+            self.module_bg(rt, br, r, 22.0, self.hovered(PHit::Memory));
+            hits.push((PHit::Memory, r));
+            let (used, total) = self.mem;
+            let gb = |b: u64| b as f32 / 1_073_741_824.0;
+            let frac = if total > 0 { used as f32 / total as f32 } else { 0.0 };
+            let level = if frac < 0.6 { hex(GREEN) } else if frac < 0.85 { hex(YELLOW) } else { hex(RED) };
+            let (x0, x1) = (r.left + 16.0, r.right - 16.0);
+            // judul: "Memory  72%"      "11.3 / 15.6 GB"
+            let tw = self.ptext(rt, br, "Memory", &p.f_text, rc(x0, r.top + 10.0, x0 + 120.0, r.top + 32.0), DWRITE_TEXT_ALIGNMENT_LEADING, white(1.0))?;
+            self.ptext(rt, br, &format!("{:.0}%", frac * 100.0), &p.f_text, rc(x0 + tw + 8.0, r.top + 10.0, x0 + tw + 70.0, r.top + 32.0), DWRITE_TEXT_ALIGNMENT_LEADING, level)?;
+            self.ptext(rt, br, &format!("{:.1} / {:.1} GB", gb(used), gb(total)), &p.f_small, rc(x0 + 120.0, r.top + 10.0, x1, r.top + 32.0), DWRITE_TEXT_ALIGNMENT_TRAILING, white(0.7))?;
+
+            // grafik: 60 titik, kanan = sekarang
+            let (gt, gb_) = (r.top + 40.0, r.top + 96.0);
+            br.SetColor(&white(0.08));
+            for k in 1..4 { let y = gt + (gb_ - gt) * k as f32 / 4.0; rt.FillRectangle(&rc(x0, y, x1, y + 1.0), br); }
+            let hist: Vec<f32> = self.mem_hist.iter().cloned().collect();
+            if hist.len() >= 2 {
+                let n = 60usize;
+                let pt_at = |i: usize, v: f32| {
+                    let slot = n - hist.len() + i; // data rata kanan
+                    pt(x0 + (x1 - x0) * slot as f32 / (n - 1) as f32, gb_ - (gb_ - gt) * v.clamp(0.0, 1.0))
+                };
+                // area di bawah garis
+                let area = self.d2d.CreatePathGeometry()?;
+                let s = area.Open()?;
+                let first = pt_at(0, hist[0]);
+                s.BeginFigure(pt(first.x, gb_), D2D1_FIGURE_BEGIN_FILLED);
+                for (i, v) in hist.iter().enumerate() { s.AddLine(pt_at(i, *v)); }
+                s.AddLine(pt(x1, gb_));
+                s.EndFigure(D2D1_FIGURE_END_CLOSED);
+                s.Close()?;
+                br.SetColor(&D2D1_COLOR_F { a: 0.22, ..level });
+                rt.FillGeometry(&area, br, None);
+                // garis
+                let line = self.d2d.CreatePathGeometry()?;
+                let s = line.Open()?;
+                s.BeginFigure(first, D2D1_FIGURE_BEGIN_HOLLOW);
+                for (i, v) in hist.iter().enumerate().skip(1) { s.AddLine(pt_at(i, *v)); }
+                s.EndFigure(D2D1_FIGURE_END_OPEN);
+                s.Close()?;
+                br.SetColor(&level);
+                rt.DrawGeometry(&line, br, 2.0, &self.soft);
+                let last = pt_at(hist.len() - 1, *hist.last().unwrap());
+                rt.FillEllipse(&D2D1_ELLIPSE { point: last, radiusX: 3.5, radiusY: 3.5 }, br);
+            }
+
+            // 3 aplikasi terbesar
+            for (i, (name, bytes)) in self.top_procs.iter().take(3).enumerate() {
+                let y = r.top + 104.0 + i as f32 * 20.0;
+                self.ptext(rt, br, name, &p.f_small, rc(x0, y, x1 - 70.0, y + 18.0), DWRITE_TEXT_ALIGNMENT_LEADING, white(0.85))?;
+                let size = if *bytes >= 1_073_741_824 { format!("{:.1} GB", gb(*bytes)) } else { format!("{} MB", bytes / 1_048_576) };
+                self.ptext(rt, br, &size, &p.f_small, rc(x1 - 70.0, y, x1, y + 18.0), DWRITE_TEXT_ALIGNMENT_TRAILING, white(0.6))?;
             }
             Ok(())
         }
@@ -948,13 +1118,19 @@ impl App {
         let Some(hit) = self.panel_hit(x, y) else { return };
         let open = |page: &str| apps::launch(page);
         match hit {
-            PHit::Conn(i) => { open(["ms-settings:network-wifi", "ms-settings:bluetooth", "ms-settings:network-airplanemode", "ms-settings:network"][i as usize]); self.close_panel(); }
-            PHit::BatteryModule | PHit::Tile(1) => { open("ms-settings:batterysaver"); self.close_panel(); }
+            PHit::Conn(3) => { open("ms-availablenetworks:"); self.close_panel(); } // daftar Wi-Fi bawaan Windows
+            PHit::Conn(i) => self.toggle_radio(i),
+            PHit::Tile(1) => self.toggle_saver(),
             PHit::Tile(_) => { open("ms-settings:nightlight"); self.close_panel(); }
+            PHit::Memory => { open("taskmgr.exe"); self.close_panel(); }
             PHit::Btn(0) => { open("ms-settings:"); self.close_panel(); }
             PHit::Btn(1) => { self.destroy_panel(); open("ms-screenclip:"); } // tutup dulu agar tidak ikut terfoto
             PHit::Btn(2) => { self.destroy_panel(); unsafe { let _ = LockWorkStation(); } }
-            PHit::Btn(_) | PHit::Power => self.power_menu(),
+            PHit::Btn(_) | PHit::Power => self.set_power_card(true),
+            PHit::PowerCancel => self.set_power_card(false),
+            PHit::PowerAct(i) => self.power_action(i),
+            PHit::MenuRow(i) => self.menu_click(i as usize, 0),
+            PHit::MenuSeg(i, o) => self.menu_click(i as usize, o as u32),
             PHit::Prev | PHit::Next => {
                 if let Some(p) = self.panel.as_mut() {
                     let (y, m) = p.month;
@@ -965,7 +1141,7 @@ impl App {
                 self.panel_invalidate();
             }
             PHit::App(i) => {
-                let target = self.panel.as_ref().map(|p| p.apps[i].1.clone());
+                let target = self.panel.as_ref().and_then(|p| p.apps.get(i).map(|a| a.1.clone())); // daftar bisa baru diperbarui
                 if let Some(t) = target { apps::launch(&t); }
                 self.close_panel();
             }
@@ -1005,34 +1181,202 @@ impl App {
     }
 
     pub fn panel_key(&mut self, vk: u32) {
-        if vk == VK_ESCAPE.0 as u32 { self.close_panel(); return; }
+        if vk == VK_ESCAPE.0 as u32 {
+            if self.panel.as_ref().map(|p| p.power).unwrap_or(false) { self.set_power_card(false); } else { self.close_panel(); }
+            return;
+        }
         if vk == VK_RETURN.0 as u32 {
-            let first = self.panel.as_ref().and_then(|p| if p.kind == PanelKind::Start { p.filtered.first().map(|&i| p.apps[i].1.clone()) } else { None });
+            let first = self.panel.as_ref().and_then(|p| if p.kind == PanelKind::Start { p.filtered.first().and_then(|&i| p.apps.get(i)).map(|a| a.1.clone()) } else { None });
             if let Some(t) = first { apps::launch(&t); self.close_panel(); }
         }
     }
 
-    fn power_menu(&mut self) {
-        let Some(hwnd) = self.panel.as_ref().map(|p| p.hwnd) else { return };
+    // ================= Menu klik kanan dock (kaca) =================
+    fn draw_menu(&self, rt: &ID2D1RenderTarget, br: &ID2D1SolidColorBrush, w: f32, hits: &mut Vec<(PHit, D2D_RECT_F)>) -> Result<()> {
         unsafe {
-            let Ok(menu) = CreatePopupMenu() else { return };
-            let _ = AppendMenuW(menu, MF_STRING, 1, w!("Sleep"));
-            let _ = AppendMenuW(menu, MF_STRING, 2, w!("Restart"));
-            let _ = AppendMenuW(menu, MF_STRING, 3, w!("Shut down"));
-            let mut pnt = POINT::default();
-            let _ = GetCursorPos(&mut pnt);
-            let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pnt.x, pnt.y, 0, hwnd, None);
-            let _ = DestroyMenu(menu);
-            match cmd.0 {
-                1 => { self.destroy_panel(); let _ = SetSuspendState(false, false, false); }
-                2 => { self.destroy_panel(); apps::run("shutdown.exe", "/r /t 0"); }
-                3 => { self.destroy_panel(); apps::run("shutdown.exe", "/s /t 0"); }
-                _ => {}
+            let p = self.panel.as_ref().unwrap();
+            let mut y = MENU_PAD;
+            for (i, it) in self.menu_items.iter().enumerate() {
+                let ih = menu_item_h(it);
+                let row = rc(MENU_PAD, y, w - MENU_PAD, y + ih);
+                let hit = PHit::MenuRow(i as u8);
+                match it {
+                    MenuItem::Sep => {
+                        br.SetColor(&white(0.12));
+                        rt.FillRectangle(&rc(16.0, y + 4.0, w - 16.0, y + 5.0), br);
+                    }
+                    MenuItem::Action { glyph, label, enabled, .. } => {
+                        if *enabled && self.hovered(hit) {
+                            br.SetColor(&white(0.13));
+                            rt.FillRoundedRectangle(&rrect(row, 9.0), br);
+                        }
+                        let a = if *enabled { 1.0 } else { 0.35 };
+                        self.ptext(rt, br, glyph, &p.f_glyph, rc(row.left + 6.0, row.top, row.left + 34.0, row.bottom), DWRITE_TEXT_ALIGNMENT_CENTER, white(0.9 * a))?;
+                        self.ptext(rt, br, label, &p.f_menu, rc(row.left + 42.0, row.top, row.right - 8.0, row.bottom), DWRITE_TEXT_ALIGNMENT_LEADING, white(a))?;
+                        if *enabled { hits.push((hit, row)); }
+                    }
+                    MenuItem::Toggle { glyph, label, on, .. } => {
+                        if self.hovered(hit) {
+                            br.SetColor(&white(0.13));
+                            rt.FillRoundedRectangle(&rrect(row, 9.0), br);
+                        }
+                        self.ptext(rt, br, glyph, &p.f_glyph, rc(row.left + 6.0, row.top, row.left + 34.0, row.bottom), DWRITE_TEXT_ALIGNMENT_CENTER, white(0.9))?;
+                        self.ptext(rt, br, label, &p.f_menu, rc(row.left + 42.0, row.top, row.right - 56.0, row.bottom), DWRITE_TEXT_ALIGNMENT_LEADING, white(1.0))?;
+                        // saklar ala iOS
+                        let cy = (row.top + row.bottom) / 2.0;
+                        let track = rc(row.right - 50.0, cy - 12.0, row.right - 8.0, cy + 12.0);
+                        br.SetColor(&if *on { hex(GREEN) } else { white(0.22) });
+                        rt.FillRoundedRectangle(&rrect(track, 12.0), br);
+                        let kx = if *on { track.right - 12.0 } else { track.left + 12.0 };
+                        br.SetColor(&white(1.0));
+                        rt.FillEllipse(&D2D1_ELLIPSE { point: pt(kx, cy), radiusX: 10.0, radiusY: 10.0 }, br);
+                        hits.push((hit, row));
+                    }
+                    MenuItem::Segmented { title, options, selected, .. } => {
+                        self.ptext(rt, br, title, &p.f_small, rc(row.left + 8.0, y + 6.0, row.right, y + 22.0), DWRITE_TEXT_ALIGNMENT_LEADING, white(0.6))?;
+                        let ctl = rc(row.left + 4.0, y + 25.0, row.right - 4.0, y + 54.0);
+                        br.SetColor(&white(0.10));
+                        rt.FillRoundedRectangle(&rrect(ctl, 9.0), br);
+                        let seg_w = (ctl.right - ctl.left) / options.len() as f32;
+                        for (o, label) in options.iter().enumerate() {
+                            let sr = rc(ctl.left + seg_w * o as f32, ctl.top, ctl.left + seg_w * (o + 1) as f32, ctl.bottom);
+                            let shit = PHit::MenuSeg(i as u8, o as u8);
+                            if o == *selected {
+                                br.SetColor(&white(0.26));
+                                rt.FillRoundedRectangle(&rrect(rc(sr.left + 2.0, sr.top + 2.0, sr.right - 2.0, sr.bottom - 2.0), 7.0), br);
+                            } else if self.hovered(shit) {
+                                br.SetColor(&white(0.08));
+                                rt.FillRoundedRectangle(&rrect(rc(sr.left + 2.0, sr.top + 2.0, sr.right - 2.0, sr.bottom - 2.0), 7.0), br);
+                            }
+                            self.ptext(rt, br, label, &p.f_text, rc(sr.left, sr.top, sr.right, sr.bottom), DWRITE_TEXT_ALIGNMENT_CENTER, white(if o == *selected { 1.0 } else { 0.72 }))?;
+                            hits.push((shit, sr));
+                        }
+                    }
+                }
+                y += ih;
+            }
+            Ok(())
+        }
+    }
+
+    /// Klik di menu: aksi biasa menutup menu; pengaturan (segmen/saklar) langsung berlaku dan menu tetap terbuka
+    fn menu_click(&mut self, i: usize, option: u32) {
+        let Some(item) = self.menu_items.get(i).cloned() else { return };
+        let target = self.menu_target;
+        match item {
+            MenuItem::Action { id, enabled: true, .. } => {
+                self.close_panel();
+                self.run_menu_cmd(id, target);
+            }
+            MenuItem::Segmented { id, .. } => {
+                self.run_menu_cmd(id + option, target);
+                self.menu_items = self.build_menu(target);
+                self.panel_invalidate();
+            }
+            MenuItem::Toggle { id, .. } => {
+                self.run_menu_cmd(id, target);
+                self.menu_items = self.build_menu(target);
+                self.panel_invalidate();
+            }
+            _ => {}
+        }
+    }
+
+    // ================= Kartu power kaca =================
+    fn set_power_card(&mut self, on: bool) {
+        let Some(p) = self.panel.as_mut() else { return };
+        if p.power == on { return; }
+        p.power = on;
+        p.hover = None;
+        unsafe { SetTimer(p.hwnd, ANIM_TIMER, 15, None); }
+    }
+
+    fn power_action(&mut self, i: u8) {
+        self.destroy_panel();
+        unsafe {
+            match i {
+                0 => { let _ = SetSuspendState(false, false, false); }
+                1 => apps::run("shutdown.exe", "/r /t 0"),
+                2 => apps::run("shutdown.exe", "/s /t 0"),
+                _ => apps::run("shutdown.exe", "/l"),
             }
         }
     }
-}
 
+    /// Lapisan redup + kartu kaca berisi Sleep / Restart / Shut down / Sign out
+    fn draw_power_card(&self, rt: &ID2D1RenderTarget, br: &ID2D1SolidColorBrush, w: f32, h: f32, t: f32, hits: &mut Vec<(PHit, D2D_RECT_F)>) -> Result<()> {
+        unsafe {
+            let p = self.panel.as_ref().unwrap();
+            let e = ease_out(t);
+            // seluruh kartu (termasuk tepi kaca) memudar bersama dalam satu lapisan
+            let layer = rt.CreateLayer(None)?;
+            let params = D2D1_LAYER_PARAMETERS {
+                contentBounds: rc(-1.0e6, -1.0e6, 1.0e6, 1.0e6),
+                geometricMask: std::mem::ManuallyDrop::new(None),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 },
+                opacity: e,
+                opacityBrush: std::mem::ManuallyDrop::new(None),
+                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+            };
+            rt.PushLayer(&params, &layer);
+            let e = 1.0; // opasitas sudah ditangani lapisan
+            // redupkan isi panel di belakang
+            br.SetColor(&col(0.02, 0.02, 0.04, 0.62 * e));
+            rt.FillRoundedRectangle(&rrect(rc(0.0, 0.0, w, h), PANEL_R), br);
+
+            const ROW: f32 = 54.0;
+            let items: [(&str, &str, Option<u32>); 4] = [
+                ("Sleep", "\u{E708}", None),
+                ("Restart", "\u{E72C}", None),
+                ("Shut down", "\u{E7E8}", Some(RED)),
+                ("Sign out", "\u{E77B}", None),
+            ];
+            let cw = (w - 40.0).min(260.0);
+            let ch = 14.0 + ROW * items.len() as f32 + 8.0 + 44.0 + 12.0;
+            let cx = (w - cw) / 2.0;
+            // kartu turun sedikit & membesar halus saat muncul
+            let cy = (h - ch) / 2.0 + (1.0 - ease_out(t)) * 18.0;
+            let card = rc(cx, cy, cx + cw, cy + ch);
+            rt.SetTransform(&Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: cx, M32: cy });
+            br.SetColor(&col(0.11, 0.11, 0.14, 0.93 * e));
+            rt.FillRoundedRectangle(&rrect(rc(0.0, 0.0, cw, ch), 22.0), br);
+            let mut look = self.style.look();
+            look.base = 0.0;
+            draw_glass(rt, br, cw, ch, 22.0, &look, 0.0)?;
+            rt.SetTransform(&Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 });
+
+            let alpha = e;
+            for (i, (label, glyph, tint)) in items.iter().enumerate() {
+                let y = card.top + 14.0 + i as f32 * ROW;
+                let row = rc(card.left + 8.0, y, card.right - 8.0, y + ROW - 6.0);
+                let hit = PHit::PowerAct(i as u8);
+                if self.hovered(hit) {
+                    br.SetColor(&white(0.12 * alpha));
+                    rt.FillRoundedRectangle(&rrect(row, 14.0), br);
+                }
+                hits.push((hit, row));
+                let (icx, icy) = (row.left + 26.0, (row.top + row.bottom) / 2.0);
+                br.SetColor(&match tint { Some(c) => D2D1_COLOR_F { a: alpha, ..hex(*c) }, None => white(0.18 * alpha) });
+                rt.FillEllipse(&D2D1_ELLIPSE { point: pt(icx, icy), radiusX: 17.0, radiusY: 17.0 }, br);
+                self.ptext(rt, br, glyph, &p.f_glyph, rc(icx - 17.0, icy - 17.0, icx + 17.0, icy + 17.0), DWRITE_TEXT_ALIGNMENT_CENTER, white(alpha))?;
+                self.ptext(rt, br, label, &p.f_text, rc(row.left + 56.0, row.top, row.right - 8.0, row.bottom), DWRITE_TEXT_ALIGNMENT_LEADING, white(alpha))?;
+            }
+            // Cancel
+            let by = card.bottom - 12.0 - 44.0;
+            let cancel = rc(card.left + 14.0, by, card.right - 14.0, by + 44.0);
+            br.SetColor(&white((if self.hovered(PHit::PowerCancel) { 0.22 } else { 0.13 }) * alpha));
+            rt.FillRoundedRectangle(&rrect(cancel, 14.0), br);
+            hits.push((PHit::PowerCancel, cancel));
+            self.ptext(rt, br, "Cancel", &p.f_text, cancel, DWRITE_TEXT_ALIGNMENT_CENTER, white(alpha))?;
+            // klik di luar kartu = batal
+            hits.push((PHit::PowerCancel, rc(0.0, 0.0, w, card.top)));
+            hits.push((PHit::PowerCancel, rc(0.0, card.bottom, w, h)));
+            rt.PopLayer();
+            Ok(())
+        }
+    }
+}
 pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         let is_ours = |a: &App| a.panel.as_ref().map(|p| p.hwnd == hwnd).unwrap_or(false);
@@ -1058,7 +1402,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
             WM_CHAR => { with_app(|a| if is_ours(a) { a.panel_char(wp.0 as u32) }); LRESULT(0) }
             WM_KEYDOWN => { with_app(|a| if is_ours(a) { a.panel_key(wp.0 as u32) }); LRESULT(0) }
-            WM_PAINT => { let _ = ValidateRect(hwnd, None); LRESULT(0) }
+            WM_PAINT => { crate::paint_noop(hwnd); LRESULT(0) }
             WM_ERASEBKGND => LRESULT(1),
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }

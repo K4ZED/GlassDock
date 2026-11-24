@@ -16,14 +16,17 @@
 #![windows_subsystem = "windows"]
 
 mod apps;
+mod osd;
 mod panels;
 mod sys;
+mod update;
 
 use panels::PanelKind;
 
 use std::{
     cell::RefCell,
     collections::HashMap,
+    ffi::c_void,
     sync::atomic::{AtomicU32, Ordering::Relaxed},
 };
 use sys::{Battery, Net};
@@ -35,6 +38,7 @@ use windows::{
             Direct2D::{Common::*, *},
             DirectWrite::*,
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+            Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS},
             Gdi::*,
             Imaging::*,
         },
@@ -56,6 +60,7 @@ use windows::{
 // ---------------- PENGATURAN (silakan ubah) ----------------
 const DOCK_H: f32 = 56.0; // tinggi dock (DIP)
 const MARGIN_B: f32 = 10.0; // jarak dari bawah layar
+const SHADOW_M: f32 = 14.0; // ruang bayangan di sekeliling dock
 const RADIUS: f32 = 20.0; // kelengkungan sudut
 const CELL: f32 = 44.0; // lebar satu ikon
 const ICON: f32 = 32.0; // ukuran gambar ikon
@@ -124,17 +129,19 @@ struct Look {
     shine: f32,     // pantulan cahaya di setengah atas
     depth: f32,     // bayangan dalam di tepi bawah (ilusi ketebalan)
     shadow: f32,    // bayangan teks agar terbaca di latar terang
+    blur: Option<D2D1_COLOR_F>, // Some = latar diburamkan sendiri + lapisan warna ini (Frosted/Dark)
 }
 
 impl Style {
     fn look(self) -> Look {
         match self {
             // Liquid Glass bening: tanpa blur, latar terlihat jelas, tepi & pantulan berkilau
-            Style::Clear => Look { accent: 0, tint: 0, base: 0.28, fill: (0.16, 0.05), rim: (0.90, 0.22), shine: 0.18, depth: 0.30, shadow: 0.60 },
+            Style::Clear => Look { accent: 0, tint: 0, base: 0.28, fill: (0.16, 0.05), rim: (0.90, 0.22), shine: 0.18, depth: 0.30, shadow: 0.60, blur: None },
             // Kaca buram (blur Acrylic)
-            Style::Frosted => Look { accent: 4, tint: 0x55202020, base: 0.0, fill: (0.10, 0.02), rim: (0.65, 0.14), shine: 0.09, depth: 0.18, shadow: 0.35 },
+            // (dulu memakai acrylic Windows, tapi itu selalu berbentuk kotak penuh termasuk area bayangan)
+            Style::Frosted => Look { accent: 0, tint: 0, base: 0.0, fill: (0.10, 0.02), rim: (0.65, 0.14), shine: 0.09, depth: 0.18, shadow: 0.35, blur: Some(col(0.10, 0.10, 0.12, 0.40)) },
             // Kaca gelap (pekat)
-            Style::Dark => Look { accent: 4, tint: 0x99141414, base: 0.0, fill: (0.08, 0.01), rim: (0.40, 0.08), shine: 0.05, depth: 0.0, shadow: 0.0 },
+            Style::Dark => Look { accent: 0, tint: 0, base: 0.0, fill: (0.08, 0.01), rim: (0.40, 0.08), shine: 0.05, depth: 0.0, shadow: 0.0, blur: Some(col(0.06, 0.06, 0.07, 0.74)) },
         }
     }
     fn name(self) -> &'static str { match self { Style::Clear => "clear", Style::Frosted => "frosted", Style::Dark => "dark" } }
@@ -185,15 +192,53 @@ fn cfg_path(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("GlassDock").join(name)
 }
 fn cfg_read(name: &str) -> Option<String> { std::fs::read_to_string(cfg_path(name)).ok() }
+/// Tulis aman: ke file sementara dulu lalu ganti, jadi file tidak pernah setengah tertulis
 fn cfg_write(name: &str, text: &str) {
     let f = cfg_path(name);
     if let Some(d) = f.parent() { let _ = std::fs::create_dir_all(d); }
-    let _ = std::fs::write(f, text);
+    let tmp = f.with_extension("tmp");
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &f).is_ok() { return; }
+    let _ = std::fs::write(&f, text);
+}
+
+// ================= Kalau crash: catat penyebabnya & kembalikan taskbar =================
+static ORIG_WORK: std::sync::Mutex<Option<[i32; 4]>> = std::sync::Mutex::new(None);
+
+/// Tambahkan satu baris bertanggal ke %TEMP%\glassdock-crash.log
+pub(crate) fn log_line(text: &str) {
+    let t = unsafe { GetLocalTime() };
+    let line = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} {text}\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    let path = std::env::temp_dir().join("glassdock-crash.log");
+    let mut prev = std::fs::read_to_string(&path).unwrap_or_default();
+    // jangan tumbuh tanpa batas: di atas 64 KB, simpan separuh terakhir saja
+    if prev.len() > 64 * 1024 {
+        let cut = prev.len() - 32 * 1024;
+        let cut = prev[cut..].find('\n').map(|i| cut + i + 1).unwrap_or(cut);
+        prev = prev[cut..].to_string();
+    }
+    let _ = std::fs::write(&path, prev + &line);
+}
+fn install_crash_handler() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("{} GlassDock crash: {info}\n", unsafe { let t = GetLocalTime(); format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond) });
+        let path = std::env::temp_dir().join("glassdock-crash.log");
+        let prev = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::write(&path, prev + &msg);
+        // jangan biarkan pengguna tanpa taskbar
+        let orig = ORIG_WORK.lock().ok().and_then(|g| *g);
+        if let Some([l, t, r, b]) = orig { restore_system(RECT { left: l, top: t, right: r, bottom: b }); } else { set_taskbar_visible(true); }
+    }));
 }
 fn load_style() -> Style { Style::from_name(&cfg_read("style.txt").unwrap_or_default()) }
 fn save_style(s: Style) { cfg_write("style.txt", s.name()); }
-fn load_autohide() -> bool { cfg_read("autohide.txt").map(|s| s.trim() != "0").unwrap_or(true) }
-fn save_autohide(on: bool) { cfg_write("autohide.txt", if on { "1" } else { "0" }); }
+#[derive(Clone, Copy, PartialEq)]
+enum HideMode { Never, Always, Smart }
+/// "0" = tidak pernah, "1" = selalu, "smart" = hanya saat ada jendela yang menutupi dock (bawaan)
+fn load_hide_mode() -> HideMode {
+    match cfg_read("autohide.txt").as_deref().map(str::trim) { Some("0") => HideMode::Never, Some("1") => HideMode::Always, _ => HideMode::Smart }
+}
+fn save_hide_mode(m: HideMode) { cfg_write("autohide.txt", match m { HideMode::Never => "0", HideMode::Always => "1", HideMode::Smart => "smart" }); }
+
 
 /// Daftar pin tersimpan di pins.txt (satu baris per aplikasi, urutan = urutan di dock)
 fn load_pins() -> Vec<apps::Pin> {
@@ -296,6 +341,13 @@ struct App {
 
     // sembunyi otomatis
     autohide: bool,
+    hide_mode: HideMode,
+    overlap: bool,       // mode cerdas: ada jendela yang menutupi area dock
+    overlap_tick: u32,
+    bg_lum: f32,         // terang rata-rata latar di belakang dock (0..1)
+    mem_hist: std::collections::VecDeque<f32>,   // pemakaian RAM 60 detik terakhir (0..1)
+    mem: (u64, u64),                             // (terpakai, total) byte
+    top_procs: Vec<(String, u64)>,               // aplikasi pemakai RAM terbesar (diisi saat Control Center terbuka)
     geom: (i32, i32, i32, i32), // x, y saat tampil, lebar, tinggi (piksel)
     shown: f32,                 // 0 = tersembunyi, 1 = tampil penuh
     slide_target: f32,
@@ -312,15 +364,198 @@ struct App {
     bright_tx: Option<std::sync::mpsc::Sender<f32>>,
     bright_rx: Option<std::sync::mpsc::Receiver<Option<f32>>>,
     bright_val: Option<f32>, // None = layar tidak mendukung pengaturan kecerahan
+    radios: sys::Radios,     // status Wi-Fi/Bluetooth asli (dibaca thread radio)
+    radio_tx: Option<std::sync::mpsc::Sender<sys::RadioCmd>>,
+    radio_rx: Option<std::sync::mpsc::Receiver<sys::Radios>>,
+    osd: Option<osd::Osd>,             // indikator volume kaca
+    osd_audio: Option<sys::Audio>,     // speaker default untuk tombol volume
+    osd_bright_last: Option<u32>,      // kecerahan terakhir dari notifikasi daya (untuk OSD kecerahan)
+    upd_tx: Option<std::sync::mpsc::Sender<update::Req>>,
+    upd_rx: Option<std::sync::mpsc::Receiver<update::Resp>>,
+    update: Option<update::Release>,   // versi baru yang tersedia (kalau ada)
+    toast: Option<update::Toast>,      // pemberitahuan update kaca
+    menu_items: Vec<panels::MenuItem>, // isi menu klik kanan kaca yang sedang terbuka
+    menu_target: Option<Hit>,          // yang diklik kanan (ikon app atau dock)
+    dock_bg: Option<(u32, u32, Vec<u8>)>, // latar buram di belakang dock (gaya Frosted/Dark)
+    dock_bg_bmp: Option<ID2D1Bitmap>,
+    bg_sig: Option<Vec<u8>>,           // sidik strip di atas dock, untuk tahu kapan latar berubah
 }
 
 const WM_APP_ICON: u32 = WM_APP + 3;
 const WM_APP_START: u32 = WM_APP + 4;
 const WM_APP_STARTAPPS: u32 = WM_APP + 5; // daftar aplikasi Start selesai dibaca
 const WM_APP_BRIGHT: u32 = WM_APP + 6; // nilai kecerahan dari thread WMI
+const WM_APP_RADIO: u32 = WM_APP + 7;  // status radio Wi-Fi/Bluetooth berubah
+const WM_APP_POWER: u32 = WM_APP + 8;  // mode daya (Battery saver) berubah
+const WM_APP_VOLKEY: u32 = WM_APP + 9; // tombol volume keyboard (wparam = kode tombol)
+const WM_APP_UPDATE: u32 = WM_APP + 10; // hasil cek / unduh update
+const WM_APP_KBLIGHT: u32 = WM_APP + 11; // lampu keyboard ASUS berubah (wparam = level 0..3)
 
 // ================= Tombol Windows -> Start menu kaca =================
+/// penjaga awal yang terus menyembunyikan taskbar lama; dimatikan bila pengguna memilih menampilkannya
+static TASKBAR_GUARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static DOCK_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+// ---- watchdog: catat bila thread utama terjebak banjir pesan/event (timer tidak jalan lagi) ----
+use std::sync::atomic::{AtomicIsize, AtomicU64};
+static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+static MSG_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAST_MSG: AtomicU32 = AtomicU32::new(0);
+static LAST_MSG_HWND: AtomicIsize = AtomicIsize::new(0);
+static SHOW_EVENTS: AtomicU64 = AtomicU64::new(0);
+static FG_EVENTS: AtomicU64 = AtomicU64::new(0);
+fn now_ms() -> u64 { T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 }
+
+fn spawn_watchdog() {
+    now_ms();
+    LAST_TICK_MS.store(now_ms(), Relaxed);
+    std::thread::spawn(|| {
+        let (mut m0, mut s0, mut f0) = (0u64, 0u64, 0u64);
+        let mut last_log = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let (m, s, f) = (MSG_COUNT.load(Relaxed), SHOW_EVENTS.load(Relaxed), FG_EVENTS.load(Relaxed));
+            let (dm, ds, df) = (m - m0, s - s0, f - f0);
+            (m0, s0, f0) = (m, s, f);
+            let now = now_ms();
+            let stale = now.saturating_sub(LAST_TICK_MS.load(Relaxed));
+            // timer 1 detik tidak jalan padahal thread sibuk = banjir (setelah sleep laptop, aktivitasnya kecil)
+            if stale > 5000 && dm + ds + df > 400 && now.saturating_sub(last_log) > 30_000 {
+                last_log = now;
+                let h = HWND(LAST_MSG_HWND.load(Relaxed) as *mut c_void);
+                log_line(&format!(
+                    "UI thread flooded for {}s: {dm} msgs (last 0x{:X} to '{}'), {ds} taskbar-show events, {df} foreground events in 2s",
+                    stale / 1000, LAST_MSG.load(Relaxed), window_class(h)
+                ));
+            }
+        }
+    });
+}
+
+/// WM_PAINT untuk jendela layered (isinya dari UpdateLayeredWindow). Harus BeginPaint/EndPaint:
+/// ValidateRect tidak menghapus tanda "internal paint", sehingga WM_PAINT datang terus tanpa henti
+/// (thread utama sibuk 100%, timer tidak jalan, panel tak terlihat & input terasa macet).
+pub(crate) fn paint_noop(hwnd: HWND) {
+    unsafe {
+        let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+        let _ = windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
+        let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
+    }
+}
+
+// ---- lampu keyboard ASUS (Fn+F4): level dibaca dari registry driver ASUS, OSD ASUS diganti OSD kaca ----
+const ASUS_KEY: PCWSTR = w!("SOFTWARE\\ASUS\\ASUS System Control Interface\\AsusOptimization\\ASUS Keyboard Hotkeys");
+static KB_LEVEL: AtomicU32 = AtomicU32::new(u32::MAX); // nilai mentah terakhir
+static KB_AT: AtomicU64 = AtomicU64::new(0);           // kapan terakhir berubah (now_ms)
+static BRIGHT_AT: AtomicU64 = AtomicU64::new(0);       // kapan kecerahan terakhir berubah (now_ms)
+static ASUS_OSD_DENIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe fn read_kb_level(key: windows::Win32::System::Registry::HKEY) -> Option<u32> {
+    use windows::Win32::System::Registry::*;
+    let mut v = 0u32;
+    let mut len = 4u32;
+    let r = RegQueryValueExW(key, w!("KeybdLightLevel"), None, None, Some(&mut v as *mut u32 as *mut u8), Some(&mut len));
+    if r.is_ok() { Some(v) } else { None }
+}
+
+/// Sembunyikan OSD bawaan ASUS ("ATKOSD2") yang sedang tampil
+unsafe fn hide_asus_osd(h: Option<HWND>) {
+    let h = match h { Some(h) => h, None => match FindWindowW(w!("CNewOsd"), PCWSTR::null()) { Ok(h) if !h.0.is_null() => h, _ => return } };
+    // di sebagian laptop AsusOSD berjalan sebagai admin -> Windows menolak (akses ditolak); di yang lain berhasil
+    if !ShowWindowAsync(h, SW_HIDE).as_bool() {
+        if !ASUS_OSD_DENIED.swap(true, Relaxed) { log_line("ASUS OSD runs elevated; it cannot be hidden, so both OSDs may show"); }
+        return;
+    }
+    let _ = SetWindowPos(h, None, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+}
+
+fn spawn_kb_light_watcher(notify: isize) {
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::System::Registry::*;
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, ASUS_KEY, 0, KEY_QUERY_VALUE | KEY_NOTIFY, &mut key).is_err() { return; } // bukan laptop ASUS
+        let Some(first) = read_kb_level(key) else { return };
+        KB_LEVEL.store(first, Relaxed);
+        loop {
+            if RegNotifyChangeKeyValue(key, false, REG_NOTIFY_CHANGE_LAST_SET, None, false).is_err() { return; }
+            let Some(v) = read_kb_level(key) else { continue };
+            let old = KB_LEVEL.swap(v, Relaxed);
+            // bit tinggi hanya penanda dari driver; level ada di 2 bit bawah (0 = mati .. 3 = paling terang)
+            if (old & 0x7F) == (v & 0x7F) { continue; }
+            KB_AT.store(now_ms(), Relaxed);
+            // beri waktu OSD ASUS muncul dulu, supaya ketahuan bisa disembunyikan atau tidak
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            hide_asus_osd(None);
+            // OSD ASUS tidak bisa disembunyikan (berjalan sebagai admin): biarkan OSD ASUS saja, jangan dobel
+            if ASUS_OSD_DENIED.load(Relaxed) { continue; }
+            let _ = PostMessageW(HWND(notify as *mut c_void), WM_APP_KBLIGHT, WPARAM((v & 0x7F) as usize), LPARAM(0));
+        }
+    });
+}
+
+/// Jendela lain muncul: OSD ASUS untuk lampu keyboard disembunyikan (OSD kaca yang tampil)
+unsafe extern "system" fn on_shell_event(_: HWINEVENTHOOK, ev: u32, h: HWND, obj: i32, _: i32, _: u32, _: u32) {
+    if obj != 0 || h.0.is_null() { return; }
+    let cls = window_class(h);
+    if cls == "CNewOsd" && (ev == EVENT_OBJECT_SHOW || ev == 0x8018) {
+        // OSD ASUS juga dipakai tombol lain (touchpad, kamera...): hanya sembunyikan bila lampu keyboard baru berubah
+        let fresh = now_ms().saturating_sub(KB_AT.load(Relaxed)) < 1500;
+        let changed = {
+            use windows::Win32::System::Registry::*;
+            let mut key = HKEY::default();
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, ASUS_KEY, 0, KEY_QUERY_VALUE, &mut key).is_ok() {
+                let v = read_kb_level(key);
+                let _ = RegCloseKey(key);
+                v.map(|v| (v & 0x7F) != (KB_LEVEL.load(Relaxed) & 0x7F)).unwrap_or(false)
+            } else { false }
+        };
+        if fresh || changed { hide_asus_osd(Some(h)); }
+        return;
+    }
+    // flyout kecerahan bawaan Windows muncul saat kecerahan berubah: sembunyikan (OSD kaca yang tampil)
+    if (ev == EVENT_OBJECT_SHOW || ev == 0x8018) && now_ms().saturating_sub(BRIGHT_AT.load(Relaxed)) < 1500 && is_brightness_flyout(h, &cls) {
+        let _ = ShowWindowAsync(h, SW_HIDE);
+    }
+}
+
+/// Flyout kecerahan/volume Windows 11: jendela XAML Explorer kecil di tengah bawah layar
+unsafe fn is_brightness_flyout(h: HWND, cls: &str) -> bool {
+    if cls != "XamlExplorerHostIslandWindow" { return false; }
+    let mut r = RECT::default();
+    if GetWindowRect(h, &mut r).is_err() { return false; }
+    let (w, ht) = (r.right - r.left, r.bottom - r.top);
+    let sw = GetSystemMetrics(SM_CXSCREEN);
+    let sh = GetSystemMetrics(SM_CYSCREEN);
+    let cx = (r.left + r.right) / 2;
+    (100..=520).contains(&w) && (30..=200).contains(&ht) && r.bottom >= sh - 160 && (cx - sw / 2).abs() < 260
+}
+
+/// Dipanggil saat notifikasi kecerahan datang: flyout Windows yang sudah telanjur tampil ikut disembunyikan
+unsafe fn hide_brightness_flyout() {
+    let mut after = HWND::default();
+    while let Ok(h) = FindWindowExW(None, after, w!("XamlExplorerHostIslandWindow"), PCWSTR::null()) {
+        if h.0.is_null() { break; }
+        if IsWindowVisible(h).as_bool() && is_brightness_flyout(h, "XamlExplorerHostIslandWindow") {
+            let _ = ShowWindowAsync(h, SW_HIDE);
+        }
+        after = h;
+    }
+}
+
+/// Hook keyboard di thread sendiri: kalau thread utama sibuk, keyboard seluruh Windows tidak ikut macet
+fn spawn_keyboard_hook(hinst: isize) {
+    std::thread::spawn(move || unsafe {
+        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), HINSTANCE(hinst as *mut c_void), 0);
+        if let Err(e) = &hook { log_line(&format!("keyboard hook failed: {e}")); }
+        // event jendela proses lain (OSD ASUS, flyout Windows) juga ditangani di thread ini, bukan thread utama
+        let _ = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, None, Some(on_shell_event), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        let _ = SetWinEventHook(0x8017, 0x8018, None, Some(on_shell_event), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        let mut m = MSG::default();
+        while GetMessageW(&mut m, None, 0, 0).as_bool() {}
+        if let Ok(h) = hook { let _ = UnhookWindowsHookEx(h); }
+    });
+}
 static WIN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WIN_COMBO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Tombol "penutup" tanpa fungsi (sama seperti yang dipakai AutoHotkey) agar Windows
@@ -345,6 +580,11 @@ unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LR
         let vk = k.vkCode;
         let down = wp.0 as u32 == WM_KEYDOWN || wp.0 as u32 == WM_SYSKEYDOWN;
         let is_win = vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32;
+        // tombol volume: dock yang mengatur volume & menampilkan OSD kaca (indikator Windows tidak muncul)
+        if (0xAD..=0xAF).contains(&vk) && !WIN_DOWN.load(Relaxed) {
+            if down { let _ = PostMessageW(HWND(DOCK_HWND.load(Relaxed) as *mut _), WM_APP_VOLKEY, WPARAM(vk as usize), LPARAM(0)); }
+            return LRESULT(1);
+        }
         if is_win {
             if down {
                 if !WIN_DOWN.swap(true, Relaxed) { WIN_COMBO.store(false, Relaxed); }
@@ -471,11 +711,19 @@ unsafe fn send_keys(keys: &[VIRTUAL_KEY]) {
     SendInput(&v, std::mem::size_of::<INPUT>() as i32);
 }
 
+fn window_class(h: HWND) -> String {
+    let mut buf = [0u16; 128];
+    let n = unsafe { GetClassNameW(h, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
 fn is_fullscreen(h: HWND) -> bool {
     unsafe {
         // jendela maximize bukan fullscreen (fullscreen asli tidak berstatus "zoomed")
         if h.0.is_null() || apps::is_desktop(h) || IsZoomed(h).as_bool() { return false; }
-        // fullscreen asli (video/game) tidak punya title bar
+        // jendela sistem layar penuh saat login/transisi (layar selamat datang, Explorer) bukan video/game
+        let cls = window_class(h);
+        if matches!(cls.as_str(), "Windows.UI.Core.CoreWindow" | "ForegroundStaging" | "XamlExplorerHostIslandWindow" | "Shell_TrayWnd" | "LockScreenControllerProxyWindow") { return false; }        // fullscreen asli (video/game) tidak punya title bar
         let style = GetWindowLongW(h, GWL_STYLE) as u32;
         if style & WS_CAPTION.0 == WS_CAPTION.0 { return false; }
         let mut r = RECT::default();
@@ -543,7 +791,14 @@ impl App {
                 hidden_fullscreen: false,
                 show_hook: HWINEVENTHOOK::default(),
                 style: load_style(),
-                autohide: load_autohide(),
+                autohide: load_hide_mode() != HideMode::Never,
+                hide_mode: load_hide_mode(),
+                overlap: false,
+                overlap_tick: 0,
+                bg_lum: 0.3,
+                mem_hist: std::collections::VecDeque::with_capacity(61),
+                mem: (0, 0),
+                top_procs: Vec::new(),
                 geom: (0, 0, 0, 0),
                 shown: 1.0,
                 slide_target: 1.0,
@@ -557,6 +812,21 @@ impl App {
                 start_rx: None,
                 bright_tx: None,
                 bright_rx: None,
+                radios: sys::Radios::default(),
+                radio_tx: None,
+                radio_rx: None,
+                osd: None,
+                osd_audio: None,
+                osd_bright_last: None,
+                upd_tx: None,
+                upd_rx: None,
+                update: None,
+                toast: None,
+                menu_items: Vec::new(),
+                menu_target: None,
+                dock_bg: None,
+                dock_bg_bmp: None,
+                bg_sig: None,
                 bright_val: None,
             })
         }
@@ -575,12 +845,17 @@ impl App {
         unsafe { sys::enable_acrylic(self.hwnd, l.accent, l.tint); }
         self.size_px = (0, 0); // pasang ulang region sesuai gaya
         self.relayout();
+        self.dock_bg = None; // paksa ambil ulang latar buram untuk gaya baru
+        self.sample_background(); // latar buram langsung siap untuk Frosted/Dark
     }
 
     // ================= Data =================
     fn tick(&mut self) {
+        LAST_TICK_MS.store(now_ms(), Relaxed);
         self.ticks += 1;
         self.check_fullscreen();
+        self.sample_background(); // murah: hanya strip kecil, blur diambil ulang bila latar berubah
+        self.sample_memory();
         // taskbar asli kadang muncul lagi (mis. dock lama baru selesai menutup): sembunyikan lagi
         if HIDE_TASKBAR && !self.taskbar_shown {
             for h in tray_windows() {
@@ -676,6 +951,7 @@ impl App {
         let fs = is_fullscreen(unsafe { GetForegroundWindow() });
         if fs != self.hidden_fullscreen {
             self.hidden_fullscreen = fs;
+            if fs { log_line(&format!("hidden for fullscreen window: {}", window_class(unsafe { GetForegroundWindow() }))); }
             unsafe { let _ = ShowWindow(self.hwnd, if fs { SW_HIDE } else { SW_SHOWNOACTIVATE }); }
         }
     }
@@ -716,27 +992,146 @@ impl App {
         self.invalidate();
     }
 
+    /// Jendela = badan dock + margin bayangan di sekelilingnya
     fn apply_geometry(&mut self, width: f32) {
         let s = scale(self.hwnd);
-        let (w, h) = ((width * s).round() as i32, (DOCK_H * s).round() as i32);
+        let m = (SHADOW_M * s).round() as i32;
+        let (bw, bh) = ((width * s).round() as i32, (DOCK_H * s).round() as i32);
+        let (w, h) = (bw + 2 * m, bh + 2 * m);
         if (w, h) == self.size_px { return; }
         self.size_px = (w, h);
         unsafe {
             let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-            let x = (sw - w) / 2;
-            let y = sh - h - (MARGIN_B * s).round() as i32;
+            let x = (sw - bw) / 2 - m;
+            let y = sh - bh - (MARGIN_B * s).round() as i32 - m;
             self.geom = (x, y, w, h);
             self.place();
             if self.style.look().accent == 0 {
-                // tanpa blur: bentuk bulat sudah dari alpha per piksel (tepi anti-aliased)
+                // tanpa blur: bentuk bulat & bayangan dari alpha per piksel (tepi anti-aliased)
                 SetWindowRgn(self.hwnd, HRGN::default(), true);
             } else {
                 // blur Acrylic perlu dipotong region agar tidak bocor di sudut
                 let r2 = (RADIUS * 2.0 * s).round() as i32;
-                let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r2, r2);
+                let rgn = CreateRoundRectRgn(m, m, m + bw + 1, m + bh + 1, r2, r2);
                 SetWindowRgn(self.hwnd, rgn, true);
             }
         }
+    }
+
+    /// Kotak badan dock (tanpa margin bayangan) saat tampil, dalam piksel layar
+    pub(crate) fn body(&self) -> (i32, i32, i32, i32) {
+        let m = (SHADOW_M * scale(self.hwnd)).round() as i32;
+        let (x, y, w, h) = self.geom;
+        (x + m, y + m, (w - 2 * m).max(0), (h - 2 * m).max(0))
+    }
+
+    /// Gaya kaca saat ini; untuk gaya bening, lapisan gelap & bayangan teks menyesuaikan terang latar
+    pub(crate) fn look(&self) -> Look {
+        let mut lk = self.style.look();
+        if lk.blur.is_none() {
+            let t = ((self.bg_lum - 0.30) / 0.45).clamp(0.0, 1.0);
+            lk.base = 0.24 + 0.36 * t;   // latar terang -> kaca lebih gelap agar teks putih terbaca
+            lk.shadow = 0.5 + 0.35 * t;
+        }
+        lk
+    }
+
+    /// Pantau latar dock tiap detik.
+    /// - Terang latar diukur dari strip tipis tepat DI ATAS dock (tidak pernah berisi dock),
+    ///   jadi tidak perlu trik apa pun dan perekam layar tidak terganggu.
+    /// - Gaya Frosted/Dark: latar buram diambil ulang hanya bila strip itu berubah (atau belum ada).
+    ///   Saat dock tampil, dock ditandai "jangan direkam" sesaat (jarang terjadi); saat tersembunyi tidak perlu.
+    fn sample_background(&mut self) {
+        let (x, y, w, h) = self.body();
+        if w == 0 { return; }
+        let s = scale(self.hwnd);
+        let strip_h = (10.0 * s).round().max(2.0) as i32;
+        let strip_y = (y - (14.0 * s).round() as i32).max(0);
+        let sig: Vec<u8> = unsafe {
+            let Some(surf) = Surface::new(48, 2) else { return };
+            let screen = GetDC(None);
+            SetStretchBltMode(surf.dc, HALFTONE);
+            let ok = StretchBlt(surf.dc, 0, 0, 48, 2, screen, x, strip_y, w, strip_h, SRCCOPY).as_bool();
+            ReleaseDC(None, screen);
+            if !ok || surf.bits.is_null() { return; }
+            std::slice::from_raw_parts(surf.bits, 48 * 2 * 4).to_vec()
+        };
+        let mut sum = 0.0f32;
+        for p in sig.chunks_exact(4) { sum += 0.0722 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.2126 * p[2] as f32; }
+        let lum = sum / (48.0 * 2.0 * 255.0);
+        if (lum - self.bg_lum).abs() > 0.04 { self.bg_lum = lum; self.invalidate(); }
+
+        if self.style.look().blur.is_none() {
+            if self.dock_bg.is_some() { self.dock_bg = None; self.dock_bg_bmp = None; }
+            self.bg_sig = None;
+            return;
+        }
+        let changed = match &self.bg_sig {
+            Some(old) => old.iter().zip(&sig).map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs()).sum::<u32>() > sig.len() as u32 * 3,
+            None => true,
+        };
+        self.bg_sig = Some(sig);
+        if self.dock_bg.is_some() && !changed { return; }
+        let on_screen = self.shown > 0.0;
+        unsafe {
+            if on_screen {
+                let _ = SetWindowDisplayAffinity(self.hwnd, WDA_EXCLUDEFROMCAPTURE);
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            }
+            let new_bg = panels::capture_blur_ex(x, y, w, h, false);
+            if on_screen { let _ = SetWindowDisplayAffinity(self.hwnd, WDA_NONE); }
+            if new_bg.is_some() {
+                self.dock_bg = new_bg;
+                self.dock_bg_bmp = None;
+                self.invalidate();
+            }
+        }
+    }
+    /// Ambil & buramkan layar di (x, y, w, h) TANPA jendela GlassDock sendiri (dock, OSD, pemberitahuan).
+    /// Dipakai saat panel/OSD/pemberitahuan muncul (sekali per kemunculan, bukan terus-menerus).
+    pub(crate) fn capture_behind(&self, x: i32, y: i32, w: i32, h: i32) -> Option<(u32, u32, Vec<u8>)> {
+        let mut ours = vec![self.hwnd];
+        if let Some(h) = self.osd_hwnd() { ours.push(h); }
+        if let Some(h) = self.toast_hwnd() { ours.push(h); }
+        unsafe {
+            for h in &ours { let _ = SetWindowDisplayAffinity(*h, WDA_EXCLUDEFROMCAPTURE); }
+            let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            let bg = panels::capture_blur_ex(x, y, w, h, true);
+            for h in &ours { let _ = SetWindowDisplayAffinity(*h, WDA_NONE); }
+            bg
+        }
+    }
+
+    /// RAM dicatat tiap detik sejak dock menyala, jadi grafik di Control Center langsung terisi
+    fn sample_memory(&mut self) {
+        let (used, total) = sys::memory();
+        if total == 0 { return; }
+        self.mem = (used, total);
+        self.mem_hist.push_back(used as f32 / total as f32);
+        while self.mem_hist.len() > 60 { self.mem_hist.pop_front(); }
+        let cc_open = self.panel.as_ref().map(|p| p.kind == PanelKind::Control).unwrap_or(false);
+        if cc_open {
+            // daftar aplikasi cukup diperbarui tiap 2 detik, dan hanya saat panel terbuka
+            if self.ticks % 2 == 0 { self.top_procs = sys::top_processes(3); }
+            self.refresh_panel();
+        }
+    }
+
+    /// Mode cerdas: apakah ada jendela (tidak di-minimize) yang menutupi area dock
+    fn windows_overlap_dock(&self) -> bool {
+        let (x, y, w, h) = self.body();
+        unsafe {
+            for win in apps::taskbar_windows() {
+                if win == self.hwnd || IsIconic(win).as_bool() { continue; }
+                let mut r = RECT::default();
+                // batas jendela yang terlihat (GetWindowRect ikut menghitung bingkai tak terlihat 7-8 px)
+                if DwmGetWindowAttribute(win, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut _ as *mut c_void, std::mem::size_of::<RECT>() as u32).is_err() {
+                    let _ = GetWindowRect(win, &mut r);
+                }
+                if r.left < x + w && r.right > x && r.top < y + h && r.bottom > y - 6 { return true; }
+            }
+        }
+        false
     }
 
     // ================= Sembunyi otomatis =================
@@ -771,16 +1166,22 @@ impl App {
     /// Dipanggil tiap 100 ms: munculkan dock saat kursor di tengah bawah layar,
     /// sembunyikan lagi setelah kursor menjauh
     fn hover_check(&mut self) {
-        if !self.autohide || self.hidden_fullscreen { return; }
+        if self.hide_mode == HideMode::Never || self.hidden_fullscreen { return; }
         let mut p = POINT::default();
         unsafe { let _ = GetCursorPos(&mut p); }
-        let (x, y, w, _) = self.geom;
+        let (x, y, w, _) = self.body();
         let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) };
         let near_x = p.x >= x - 30 && p.x <= x + w + 30;
         let at_edge = near_x && p.y >= sh - 3;
         let over = near_x && self.slide_target > 0.5 && p.y >= y - 12;
+        // mode cerdas: cek tumpang-tindih jendela tiap 300 ms; tidak ada yang menutupi -> dock tetap tampil
+        if self.hide_mode == HideMode::Smart {
+            self.overlap_tick += 1;
+            if self.overlap_tick % 3 == 0 { self.overlap = self.windows_overlap_dock(); }
+        }
+        let keep = self.hide_mode == HideMode::Smart && !self.overlap;
         let now = std::time::Instant::now();
-        if at_edge || over || self.panel.is_some() {
+        if at_edge || over || keep || self.panel.is_some() {
             self.last_over = now;
             self.slide_to(1.0);
         } else if self.slide_target > 0.5 && now > self.last_over && (now - self.last_over).as_millis() > HIDE_DELAY_MS {
@@ -789,10 +1190,16 @@ impl App {
         }
     }
 
+    fn set_hide_mode(&mut self, mode: HideMode) {
+        self.hide_mode = mode;
+        self.overlap = false;
+        save_hide_mode(mode);
+        self.set_autohide(mode != HideMode::Never);
+    }
+
     fn set_autohide(&mut self, on: bool) {
         self.autohide = on;
         AUTOHIDE.store(on, Relaxed);
-        save_autohide(on);
         unsafe {
             if on {
                 self.last_over = std::time::Instant::now();
@@ -805,9 +1212,13 @@ impl App {
         if !self.taskbar_shown { set_work_area(desired_work_area(self.hwnd)); }
     }
 
-    fn save_pins(&mut self) {
+    fn write_pins(&self) {
         let text: Vec<&str> = self.pins.iter().map(|p| p.spec.as_str()).collect();
         cfg_write("pins.txt", &text.join("\n"));
+    }
+
+    fn save_pins(&mut self) {
+        self.write_pins(); // tulis dulu, baru perbarui tampilan
         self.refresh_apps();
     }
 
@@ -844,6 +1255,7 @@ impl App {
 
     fn toggle_taskbar(&mut self) {
         self.taskbar_shown = !self.taskbar_shown;
+        TASKBAR_GUARD.store(false, Relaxed);
         if self.taskbar_shown {
             restore_system(self.orig_work);
         } else {
@@ -853,69 +1265,83 @@ impl App {
         self.invalidate();
     }
 
-    fn context_menu(&mut self, hit: Option<Hit>) {
-        unsafe {
-            let Ok(menu) = CreatePopupMenu() else { return };
-            if let Some(Hit::App(i)) = hit {
-                let has_win = self.items.get(i).map(|it| !it.windows.is_empty()).unwrap_or(false);
-                let pinned = self.items.get(i).map(|it| it.pinned).unwrap_or(false);
-                let _ = AppendMenuW(menu, MF_STRING, 10, w!("Open new window"));
-                if has_win { let _ = AppendMenuW(menu, MF_STRING, 11, w!("Close all windows")); }
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                if pinned {
-                    let _ = AppendMenuW(menu, MF_STRING, 12, w!("Unpin from dock"));
-                    let grey = |ok: bool| if ok { MF_STRING } else { MF_STRING | MF_GRAYED };
-                    let _ = AppendMenuW(menu, grey(i > 0), 14, w!("Move left"));
-                    let _ = AppendMenuW(menu, grey(i + 1 < self.pins.len()), 15, w!("Move right"));
-                } else {
-                    let _ = AppendMenuW(menu, MF_STRING, 13, w!("Pin to dock"));
-                }
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    /// Isi menu klik kanan. Nomor perintah sama dengan yang dipakai run_menu_cmd.
+    fn build_menu(&self, hit: Option<Hit>) -> Vec<panels::MenuItem> {
+        use panels::MenuItem::*;
+        let mut m = Vec::new();
+        if let Some(Hit::App(i)) = hit {
+            let has_win = self.items.get(i).map(|it| !it.windows.is_empty()).unwrap_or(false);
+            let pinned = self.items.get(i).map(|it| it.pinned).unwrap_or(false);
+            m.push(Action { id: 10, glyph: "\u{E8A7}", label: "Open new window".into(), enabled: true });
+            if has_win { m.push(Action { id: 11, glyph: "\u{E711}", label: "Close all windows".into(), enabled: true }); }
+            m.push(Sep);
+            if pinned {
+                m.push(Action { id: 12, glyph: "\u{E77A}", label: "Unpin from dock".into(), enabled: true });
+                m.push(Action { id: 14, glyph: "\u{E72B}", label: "Move left".into(), enabled: i > 0 });
+                m.push(Action { id: 15, glyph: "\u{E72A}", label: "Move right".into(), enabled: i + 1 < self.pins.len() });
+            } else {
+                m.push(Action { id: 13, glyph: "\u{E718}", label: "Pin to dock".into(), enabled: true });
             }
-            let ah = if self.autohide { MF_STRING | MF_CHECKED } else { MF_STRING };
-            let _ = AppendMenuW(menu, ah, 22, w!("Auto-hide"));
-            if let Ok(sub) = CreatePopupMenu() {
-                for (id, s, label) in [(30, Style::Clear, w!("Clear (Liquid Glass)")), (31, Style::Frosted, w!("Frosted")), (32, Style::Dark, w!("Dark"))] {
-                    let flag = if self.style == s { MF_STRING | MF_CHECKED } else { MF_STRING };
-                    let _ = AppendMenuW(sub, flag, id, label);
-                }
-                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("Glass style"));
-            }
-            let _ = AppendMenuW(menu, MF_STRING, 20, if self.taskbar_shown { w!("Hide Windows taskbar") } else { w!("Show Windows taskbar") });
-            let _ = AppendMenuW(menu, MF_STRING, 21, w!("Quit GlassDock"));
-            let mut p = POINT::default();
-            let _ = GetCursorPos(&mut p);
-            let _ = SetForegroundWindow(self.hwnd);
-            let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_BOTTOMALIGN, p.x, p.y, 0, self.hwnd, None);
-            let _ = DestroyMenu(menu);
-            match (cmd.0, hit) {
-                (10, Some(Hit::App(i))) => { if let Some(it) = self.items.get(i) { apps::launch(&it.launch); } }
-                (11, Some(Hit::App(i))) => { if let Some(it) = self.items.get(i) { for w in &it.windows { apps::close(*w); } } }
-                (12, Some(Hit::App(i))) => {
-                    if i < self.pins.len() { self.pins.remove(i); self.save_pins(); }
-                }
-                (13, Some(Hit::App(i))) => {
-                    if let Some(it) = self.items.get(i) { self.pins.push(apps::pin_from_item(it)); self.save_pins(); }
-                }
-                (14, Some(Hit::App(i))) => {
-                    if i > 0 && i < self.pins.len() { self.pins.swap(i, i - 1); self.save_pins(); }
-                }
-                (15, Some(Hit::App(i))) => {
-                    if i + 1 < self.pins.len() { self.pins.swap(i, i + 1); self.save_pins(); }
-                }
-                (22, _) => self.set_autohide(!self.autohide),
-                (20, _) => self.toggle_taskbar(),
-                (30..=32, _) => {
-                    let s = [Style::Clear, Style::Frosted, Style::Dark][(cmd.0 - 30) as usize];
-                    self.apply_style(s);
-                    save_style(s);
-                }
-                (21, _) => { let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)); }
-                _ => {}
-            }
+            m.push(Sep);
         }
+        let hide = match self.hide_mode { HideMode::Smart => 0, HideMode::Always => 1, HideMode::Never => 2 };
+        m.push(Segmented { id: 22, title: "Auto-hide", options: ["Smart", "Always", "Never"], selected: hide });
+        let style = match self.style { Style::Clear => 0, Style::Frosted => 1, Style::Dark => 2 };
+        m.push(Segmented { id: 30, title: "Glass style", options: ["Clear", "Frosted", "Dark"], selected: style });
+        m.push(Toggle { id: 20, glyph: "\u{E7F4}", label: "Windows taskbar", on: self.taskbar_shown });
+        m.push(Sep);
+        match &self.update {
+            Some(r) => m.push(Action { id: 40, glyph: "\u{E896}", label: format!("Update to {}", r.version), enabled: true }),
+            None => m.push(Action { id: 41, glyph: "\u{E895}", label: "Check for updates".into(), enabled: true }),
+        }
+        m.push(Action { id: 21, glyph: "\u{E7E8}", label: "Quit GlassDock".into(), enabled: true });
+        m
     }
 
+    /// Klik kanan: menu kaca di atas dock, sejajar kursor
+    fn context_menu(&mut self, hit: Option<Hit>) {
+        self.menu_items = self.build_menu(hit);
+        self.menu_target = hit;
+        let mut p = POINT::default();
+        unsafe { let _ = GetCursorPos(&mut p); }
+        let (bx, _, _, _) = self.body();
+        let anchor = (p.x - bx) as f32 / scale(self.hwnd);
+        if self.panel.as_ref().map(|p| p.kind == PanelKind::Menu).unwrap_or(false) { self.destroy_panel(); }
+        self.toggle_panel(PanelKind::Menu, anchor);
+    }
+
+    /// Jalankan perintah menu klik kanan
+    fn run_menu_cmd(&mut self, cmd: u32, hit: Option<Hit>) {
+        match (cmd, hit) {
+            (10, Some(Hit::App(i))) => { if let Some(it) = self.items.get(i) { apps::launch(&it.launch); } }
+            (11, Some(Hit::App(i))) => { if let Some(it) = self.items.get(i) { for w in &it.windows { apps::close(*w); } } }
+            (12, Some(Hit::App(i))) => {
+                if i < self.pins.len() { self.pins.remove(i); self.save_pins(); }
+            }
+            (13, Some(Hit::App(i))) => {
+                if let Some(it) = self.items.get(i) { self.pins.push(apps::pin_from_item(it)); self.save_pins(); }
+            }
+            (14, Some(Hit::App(i))) => {
+                if i > 0 && i < self.pins.len() { self.pins.swap(i, i - 1); self.save_pins(); }
+            }
+            (15, Some(Hit::App(i))) => {
+                if i + 1 < self.pins.len() { self.pins.swap(i, i + 1); self.save_pins(); }
+            }
+            (22, _) => self.set_hide_mode(HideMode::Smart),
+            (23, _) => self.set_hide_mode(HideMode::Always),
+            (24, _) => self.set_hide_mode(HideMode::Never),
+            (20, _) => self.toggle_taskbar(),
+            (30..=32, _) => {
+                let s = [Style::Clear, Style::Frosted, Style::Dark][(cmd - 30) as usize];
+                self.apply_style(s);
+                save_style(s);
+            }
+            (21, _) => unsafe { let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)); },
+            (40, _) => self.start_update(),
+            (41, _) => self.check_updates_now(),
+            _ => {}
+        }
+    }
     // ================= Gambar =================
     fn create_target(&mut self) -> Result<()> {
         unsafe {
@@ -932,6 +1358,7 @@ impl App {
             self.brush = Some(rt.CreateSolidColorBrush(&white(1.0), None)?);
             self.rt = Some(rt);
             for ic in self.icons.values_mut() { ic.bmp = None; }
+            self.dock_bg_bmp = None; // bitmap milik render target lama
             Ok(())
         }
     }
@@ -984,8 +1411,56 @@ impl App {
 
             rt.BeginDraw();
             rt.Clear(Some(&col(0.0, 0.0, 0.0, 0.0))); // transparan -> kaca Acrylic terlihat
+            rt.SetTransform(&windows::Foundation::Numerics::Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 }); // transform frame sebelumnya tersimpan di render target
 
-            draw_glass(&rt, &br, w, h, RADIUS, &self.style.look(), 0.0)?;
+            // bayangan berlapis di luar badan dock: tepi tetap terlihat di atas jendela gelap maupun terang
+            let m = SHADOW_M;
+            let (bw, bh) = (w - 2.0 * m, h - 2.0 * m);
+            let lk = self.look();
+            {
+                for i in 1..=6 {
+                    let e = i as f32 * 1.8;
+                    br.SetColor(&col(0.0, 0.0, 0.0, 0.055 * (1.0 - i as f32 / 7.0)));
+                    rt.FillRoundedRectangle(&rrect(rc(m - e, m - e + i as f32 * 0.9, m + bw + e, m + bh + e + i as f32 * 0.9), RADIUS + e), &br);
+                }
+                // garis gelap tipis tepat di luar tepi kaca
+                br.SetColor(&col(0.0, 0.0, 0.0, 0.32));
+                rt.DrawRoundedRectangle(&rrect(rc(m - 0.5, m - 0.5, m + bw + 0.5, m + bh + 0.5), RADIUS + 0.5), &br, 1.0, None);
+            }
+            rt.SetTransform(&windows::Foundation::Numerics::Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: m, M32: m });
+            let (w, h) = (bw, bh);
+            if let Some(tint) = lk.blur {
+                // latar buram buatan sendiri, dipotong sudut membulat (bukan kotak acrylic)
+                if self.dock_bg_bmp.is_none() {
+                    if let Some((iw, ih, data)) = &self.dock_bg {
+                        let props = D2D1_BITMAP_PROPERTIES {
+                            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                            dpiX: 96.0,
+                            dpiY: 96.0,
+                        };
+                        self.dock_bg_bmp = rt.CreateBitmap(D2D_SIZE_U { width: *iw, height: *ih }, Some(data.as_ptr() as *const c_void), iw * 4, &props).ok();
+                    }
+                }
+                let body = rrect(rc(0.0, 0.0, w, h), RADIUS);
+                match (&self.dock_bg_bmp, &self.dock_bg) {
+                    (Some(bmp), Some((iw, ih, _))) => {
+                        let bb = rt.CreateBitmapBrush(
+                            bmp,
+                            Some(&D2D1_BITMAP_BRUSH_PROPERTIES { extendModeX: D2D1_EXTEND_MODE_CLAMP, extendModeY: D2D1_EXTEND_MODE_CLAMP, interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR }),
+                            None,
+                        )?;
+                        bb.SetTransform(&windows::Foundation::Numerics::Matrix3x2 { M11: w / *iw as f32, M12: 0.0, M21: 0.0, M22: h / *ih as f32, M31: 0.0, M32: 0.0 });
+                        rt.FillRoundedRectangle(&body, &bb);
+                    }
+                    _ => { br.SetColor(&col(0.12, 0.12, 0.14, 0.9)); rt.FillRoundedRectangle(&body, &br); }
+                }
+                br.SetColor(&tint);
+                rt.FillRoundedRectangle(&body, &br);
+            }
+            draw_glass(&rt, &br, w, h, RADIUS, &lk, 0.0)?;
+            // garis tepi dalam 1px yang rata di semua sisi (bukan hanya kilau atas)
+            br.SetColor(&white(0.16));
+            rt.DrawRoundedRectangle(&rrect(rc(1.0, 1.0, w - 1.0, h - 1.0), RADIUS - 1.0), &br, 1.0, None);
 
             // sorotan saat kursor di atas
             if let Some(hv) = self.hover {
@@ -1018,6 +1493,7 @@ impl App {
                     self.rt = None;
                     self.brush = None;
                     for ic in self.icons.values_mut() { ic.bmp = None; }
+            self.dock_bg_bmp = None; // bitmap milik render target lama
                     self.invalidate();
                     return Ok(());
                 }
@@ -1154,7 +1630,7 @@ impl App {
                 let _ = l.SetFontSize(7.0, DWRITE_TEXT_RANGE { startPosition: digits, length: 1 });
                 let _ = l.SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_RANGE { startPosition: digits, length: 1 });
                 let (x, y) = (cx - bw / 2.0, cy + RING_R - 2.0 - bh / 2.0);
-                let sh = self.style.look().shadow;
+                let sh = self.look().shadow;
                 if sh > 0.0 {
                     br.SetColor(&col(0.0, 0.0, 0.0, sh));
                     rt.DrawTextLayout(pt(x, y + 0.8), &l, br, D2D1_DRAW_TEXT_OPTIONS_NONE);
@@ -1234,7 +1710,7 @@ impl App {
             let d: Vec<u16> = self.date.encode_utf16().collect();
             let ld = self.dw.CreateTextLayout(&d, &self.f_date, w, 16.0)?;
             // bayangan teks agar tetap terbaca saat kaca bening di atas latar terang
-            let sh = self.style.look().shadow;
+            let sh = self.look().shadow;
             if sh > 0.0 {
                 br.SetColor(&col(0.0, 0.0, 0.0, sh));
                 rt.DrawTextLayout(pt(r.left, mid - 16.2), &lt, br, D2D1_DRAW_TEXT_OPTIONS_NONE);
@@ -1255,15 +1731,35 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 unsafe extern "system" fn on_foreground_event(_: HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
+    FG_EVENTS.fetch_add(1, Relaxed);
     with_app(|a| a.on_foreground());
+}
+
+thread_local! {
+    /// (awal jendela hitungan, jumlah sembunyikan, jeda sampai)
+    static HIDE_RATE: std::cell::Cell<(u64, u32, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 /// Windows kadang memunculkan lagi taskbar (mis. saat tombol Start ditekan): sembunyikan lagi
 unsafe extern "system" fn on_show_event(_: HWINEVENTHOOK, _: u32, h: HWND, obj: i32, _: i32, _: u32, _: u32) {
     if obj != 0 { return; } // OBJID_WINDOW
+    SHOW_EVENTS.fetch_add(1, Relaxed);
+    // Explorer bisa terus memunculkan taskbar (mis. setelah laptop bangun dari sleep).
+    // Jangan adu cepat tanpa henti: terlalu sering dalam 2 detik -> berhenti sebentar, penjaga detik-an yang lanjut.
+    let now = now_ms();
+    let (start, n, pause) = HIDE_RATE.with(|c| c.get());
+    if now < pause { return; }
+    let (start, n) = if now - start > 2000 { (now, 0) } else { (start, n) };
+    if n >= 20 {
+        log_line("taskbar keeps reappearing; pausing the instant re-hide for 5s");
+        HIDE_RATE.with(|c| c.set((now, 0, now + 5000)));
+        return;
+    }
+    HIDE_RATE.with(|c| c.set((start, n + 1, 0)));
     with_app(|a| {
         if !a.taskbar_shown && tray_windows().contains(&h) {
-            let _ = ShowWindow(h, SW_HIDE);
+            // async: ShowWindow biasa menunggu explorer (thread utama bisa tertahan)
+            let _ = ShowWindowAsync(h, SW_HIDE);
         }
     });
 }
@@ -1281,10 +1777,11 @@ fn mouse_dip(hwnd: HWND, lp: LPARAM) -> (f32, f32) {
     let s = scale(hwnd);
     let x = (lp.0 & 0xffff) as u16 as i16 as f32;
     let y = ((lp.0 >> 16) & 0xffff) as u16 as i16 as f32;
-    (x / s, y / s)
+    (x / s - SHADOW_M, y / s - SHADOW_M) // koordinat badan dock (tanpa margin bayangan)
 }
 
 fn restore_system(orig: RECT) {
+    TASKBAR_GUARD.store(false, std::sync::atomic::Ordering::Relaxed);
     set_work_area(orig);
     for h in tray_windows() {
         // async: ShowWindow biasa menunggu explorer dan bisa macet ~10 detik
@@ -1338,13 +1835,28 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             WM_APP_STARTAPPS => { with_app(|a| a.on_start_list()); LRESULT(0) }
             WM_APP_BRIGHT => { with_app(|a| a.on_brightness()); LRESULT(0) }
+            WM_APP_RADIO => { with_app(|a| a.on_radios()); LRESULT(0) }
+            WM_APP_POWER => { with_app(|a| a.refresh_panel()); LRESULT(0) }
+            WM_POWERBROADCAST if wp.0 == 0x8013 /* PBT_POWERSETTINGCHANGE */ && lp.0 != 0 => {
+                let ps = &*(lp.0 as *const windows::Win32::System::Power::POWERBROADCAST_SETTING);
+                if ps.PowerSetting == GUID::from_u128(0x8ffee2c6_2d01_46be_adb9_398addc5b4ff) && ps.DataLength >= 4 {
+                    let pct = std::ptr::read_unaligned(ps.Data.as_ptr() as *const u32);
+                    BRIGHT_AT.store(now_ms(), Relaxed);
+                    hide_brightness_flyout();
+                    with_app(|a| a.on_brightness_change(pct));
+                }
+                LRESULT(1)
+            }
+            WM_APP_KBLIGHT => { with_app(|a| a.on_kb_light(wp.0 as u32)); LRESULT(0) }
+            WM_APP_VOLKEY => { with_app(|a| a.on_volume_key(wp.0 as u32)); LRESULT(0) }
+            WM_APP_UPDATE => { with_app(|a| a.on_update_msg()); LRESULT(0) }
             WM_APP_ICON => {
                 // ikon Start menu selesai dimuat di thread latar belakang
                 with_app(|a| a.receive_icons());
                 LRESULT(0)
             }
             WM_PAINT => {
-                let _ = ValidateRect(hwnd, None);
+                paint_noop(hwnd);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
@@ -1427,9 +1939,36 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 fn main() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // GetLastError bisa berisi sisa error lama; kosongkan dulu supaya cek 'sudah berjalan' tidak keliru
+        windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0));
         let _mutex = CreateMutexW(None, true, w!("GlassDock.SingleInstance"))?;
-        if GetLastError() == ERROR_ALREADY_EXISTS { return Ok(()); }
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        if GetLastError() == ERROR_ALREADY_EXISTS { log_line("launched, but another GlassDock is already running"); return Ok(()); }
+        log_line("launched");
+        // Dijalankan lewat Scheduled Task saat login: bisa lebih cepat dari desktop Windows.
+        // Tunggu taskbar Windows ada dulu (maks. 2 menit) supaya bisa disembunyikan dengan benar.
+        let mut waited = 0;
+        while FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).map(|h| h.0.is_null()).unwrap_or(true) && waited < 2400 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            waited += 1;
+        }
+        if waited > 0 { log_line(&format!("waited {:.1}s for the Windows desktop", waited as f32 / 20.0)); }
+        // Sembunyikan taskbar lama SEKARANG (sebelum dock selesai disiapkan), lalu jaga 20 detik:
+        // saat login Explorer bisa menampilkannya lagi beberapa kali.
+        if HIDE_TASKBAR {
+            std::thread::spawn(|| {
+                for _ in 0..200 {
+                    if !TASKBAR_GUARD.load(Relaxed) { break; }
+                    for h in tray_windows() {
+                        if IsWindowVisible(h).as_bool() { let _ = ShowWindowAsync(h, SW_HIDE); }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+        }
+        install_crash_handler();
+        let w = get_work_area();
+        if let Ok(mut g) = ORIG_WORK.lock() { *g = Some([w.left, w.top, w.right, w.bottom]); }
+        if let Err(e) = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() { log_line(&format!("CoInitializeEx failed: {e}")); }
         sys::force_dark_menus(); // menu klik kanan selalu gelap
 
         let hinst = GetModuleHandleW(None)?;
@@ -1450,13 +1989,32 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         RegisterClassW(&pc);
-        let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-            class, w!("GlassDock"), WS_POPUP,
-            0, 0, 400, 56, None, None, HINSTANCE(hinst.0), None,
-        )?;
-        let app = App::new(hwnd)?;
-        APP.with(|c| *c.borrow_mut() = Some(app));
+        osd::register_class(hinst.into());
+        update::register_class(hinst.into());
+        // Saat login, Windows kadang belum siap (grafis/audio/Wi-Fi) dan pembuatan dock gagal.
+        // Jangan langsung keluar diam-diam: catat penyebabnya dan coba lagi sampai ~1 menit.
+        let mut attempt = 0;
+        let hwnd = loop {
+            let made = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                class, w!("GlassDock"), WS_POPUP,
+                0, 0, 400, 56, None, None, HINSTANCE(hinst.0), None,
+            )
+            .and_then(|h| match App::new(h) {
+                Ok(app) => Ok((h, app)),
+                Err(e) => { let _ = DestroyWindow(h); Err(e) }
+            });
+            match made {
+                Ok((h, app)) => { APP.with(|c| *c.borrow_mut() = Some(app)); break h; }
+                Err(e) => {
+                    attempt += 1;
+                    log_line(&format!("startup attempt {attempt} failed: {e}"));
+                    if attempt >= 20 { return Err(e); }
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            }
+        };
+        if attempt > 0 { log_line(&format!("started after {} retries", attempt)); }
         with_app(|a| {
             AUTOHIDE.store(a.autohide, Relaxed);
             if a.autohide { SetTimer(hwnd, TIMER_HOVER, 100, None); }
@@ -1468,6 +2026,7 @@ fn main() -> Result<()> {
             a.relayout();
             a.start_anim(); // cincin terisi dari 0 saat dock muncul
             a.preload(); // siapkan daftar aplikasi, ikon, dan kecerahan di latar belakang
+            a.start_updater(); // cek GitHub Releases sekali sehari
             if HIDE_TASKBAR {
                 set_taskbar_visible(false);
                 set_work_area(desired_work_area(hwnd));
@@ -1486,14 +2045,23 @@ fn main() -> Result<()> {
         );
         // tombol Windows di keyboard membuka Start menu kaca
         DOCK_HWND.store(hwnd.0 as isize, Relaxed);
-        let kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), HINSTANCE(hinst.0), 0).ok();
+        // kecerahan layar berubah (Fn+F5/F6 dll.) -> WM_POWERBROADCAST -> OSD kaca kecerahan
+        let bright_guid = GUID::from_u128(0x8ffee2c6_2d01_46be_adb9_398addc5b4ff); // GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS
+        if let Err(e) = windows::Win32::System::Power::RegisterPowerSettingNotification(
+            HANDLE(hwnd.0), &bright_guid, windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_WINDOW_HANDLE,
+        ) { log_line(&format!("brightness notification failed: {e}")); }
+        spawn_keyboard_hook(hinst.0 as isize);
+        spawn_kb_light_watcher(hwnd.0 as isize);
+        spawn_watchdog();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            MSG_COUNT.fetch_add(1, Relaxed);
+            LAST_MSG.store(msg.message, Relaxed);
+            LAST_MSG_HWND.store(msg.hwnd.0 as isize, Relaxed);
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if let Some(h) = kb_hook { let _ = UnhookWindowsHookEx(h); }
         let _ = UnhookWinEvent(fg_hook);
         with_app(|a| if !a.show_hook.0.is_null() { let _ = UnhookWinEvent(a.show_hook); });
         APP.with(|c| *c.borrow_mut() = None);

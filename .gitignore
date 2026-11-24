@@ -5,3 +5,6 @@
 # editor
 .vscode/
 .idea/
+
+# installer hasil build
+/installer/Output/

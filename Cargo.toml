@@ -1,6 +1,6 @@
 [package]
 name = "glassdock"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2021"
 
 [dependencies.windows]
@@ -43,6 +43,13 @@ features = [
     "Win32_System_Ole",
     "Win32_System_Shutdown",
     "Win32_System_Rpc",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_Networking_WinHttp",
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
 ]
 
 [profile.release]

@@ -119,7 +119,7 @@ fn resolve_lnk(path: &str) -> Option<String> {
     }
 }
 
-fn process_path(pid: u32) -> Option<String> {
+pub(crate) fn process_path(pid: u32) -> Option<String> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];

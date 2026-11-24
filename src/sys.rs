@@ -198,6 +198,182 @@ fn ethernet_up() -> bool {
     }
 }
 
+// ---- Radio Wi-Fi & Bluetooth (WinRT Windows.Devices.Radios) ----
+/// None = perangkat tidak punya radio itu
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub struct Radios { pub wifi: Option<bool>, pub bt: Option<bool> }
+
+impl Radios {
+    /// "Airplane" = semua radio yang ada sedang mati
+    pub fn airplane(&self) -> bool { self.wifi != Some(true) && self.bt != Some(true) && (self.wifi.is_some() || self.bt.is_some()) }
+}
+
+/// Perintah ke thread radio: 0 = toggle Wi-Fi, 1 = toggle Bluetooth, 2 = toggle airplane (semua radio)
+pub type RadioCmd = u8;
+
+/// Thread khusus pemilik objek Radio. Menjalankan perintah, lalu membaca status tiap 2 detik
+/// (juga menangkap perubahan dari luar GlassDock) dan memberi tahu jendela `notify` lewat `msg`.
+pub fn spawn_radio_worker(notify: isize, msg: u32) -> (std::sync::mpsc::Sender<RadioCmd>, std::sync::mpsc::Receiver<Radios>) {
+    use windows::Devices::Radios::{Radio, RadioKind, RadioState};
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<RadioCmd>();
+    let (st_tx, st_rx) = std::sync::mpsc::channel::<Radios>();
+    std::thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = Radio::RequestAccessAsync().and_then(|op| op.get());
+        let list: Vec<Radio> = Radio::GetRadiosAsync()
+            .and_then(|op| op.get())
+            .map(|v| (0..v.Size().unwrap_or(0)).filter_map(|i| v.GetAt(i).ok()).collect())
+            .unwrap_or_default();
+        let find = |k: RadioKind| list.iter().find(|r| r.Kind().map(|x| x == k).unwrap_or(false)).cloned();
+        let (wifi, bt) = (find(RadioKind::WiFi), find(RadioKind::Bluetooth));
+        let is_on = |r: &Option<Radio>| r.as_ref().and_then(|r| r.State().ok()).map(|s| s == RadioState::On);
+        let set = |r: &Option<Radio>, on: bool| {
+            if let Some(r) = r { let _ = r.SetStateAsync(if on { RadioState::On } else { RadioState::Off }).and_then(|op| op.get()); }
+        };
+        let read = || Radios { wifi: is_on(&wifi), bt: is_on(&bt) };
+        let mut last: Option<Radios> = None;
+        loop {
+            match cmd_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(cmd) => {
+                    let now = read();
+                    match cmd {
+                        0 => set(&wifi, now.wifi != Some(true)),
+                        1 => set(&bt, now.bt != Some(true)),
+                        _ => { let on = now.airplane(); set(&wifi, on); set(&bt, on); }
+                    }
+                    last = None; // kirim status baru walau sama
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
+            let now = read();
+            if last != Some(now) {
+                last = Some(now);
+                if st_tx.send(now).is_err() { break; }
+                let _ = PostMessageW(HWND(notify as *mut c_void), msg, WPARAM(0), LPARAM(0));
+            }
+        }
+    });
+    (cmd_tx, st_rx)
+}
+
+// ---- Battery saver: status asli dari "effective power mode" + saklar langsung ----
+static POWER_NOTIFY: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static POWER_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// mode daya efektif terakhir (0 = Battery saver aktif), -1 = belum diketahui
+pub static POWER_MODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+unsafe extern "system" fn on_power_mode(mode: windows::Win32::System::Power::EFFECTIVE_POWER_MODE, _ctx: *const c_void) {
+    use std::sync::atomic::Ordering::Relaxed;
+    POWER_MODE.store(mode.0, Relaxed);
+    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(HWND(POWER_NOTIFY.load(Relaxed) as *mut c_void), POWER_MSG.load(Relaxed), WPARAM(0), LPARAM(0));
+}
+
+/// Windows memberi tahu setiap kali mode daya berubah (termasuk Battery saver dinyalakan dari luar)
+pub fn watch_power_mode(notify: isize, msg: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    POWER_NOTIFY.store(notify, Relaxed);
+    POWER_MSG.store(msg, Relaxed);
+    unsafe {
+        let mut handle: *mut c_void = null_mut();
+        let _ = windows::Win32::System::Power::PowerRegisterForEffectivePowerModeNotifications(2 /* V2 */, Some(on_power_mode), None, &mut handle);
+    }
+}
+
+/// Battery saver aktif? Dari mode daya efektif; cadangan: bendera status daya
+pub fn saver_on() -> bool {
+    let m = POWER_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    if m >= 0 { m == 0 } else { battery().saver }
+}
+
+const GUID_ENERGY_SAVER_SUBGROUP: GUID = GUID::from_u128(0xde830923_a562_41af_a086_e3a2c6bad2da);
+const GUID_ENERGY_SAVER_THRESHOLD: GUID = GUID::from_u128(0xe69653ca_cf7f_4f05_aa73_cb833fa90ad4);
+
+/// Nyalakan/matikan Battery saver (hanya bisa saat memakai baterai, seperti Quick Settings Windows).
+/// Caranya: ambang "nyala otomatis" dijadikan 100% (langsung aktif), lalu dikembalikan ke nilai semula.
+/// `saved` = ambang asli pengguna (disimpan pemanggil supaya bisa dikembalikan). Mengembalikan ambang baru.
+pub fn set_saver(on: bool, saved: u32) -> Option<u32> {
+    use windows::Win32::System::Power::{PowerGetActiveScheme, PowerReadDCValueIndex, PowerSetActiveScheme, PowerWriteDCValueIndex};
+    unsafe {
+        let mut scheme: *mut GUID = null_mut();
+        if PowerGetActiveScheme(None, &mut scheme).0 != 0 || scheme.is_null() { return None; }
+        let mut cur = 0u32;
+        let _ = PowerReadDCValueIndex(None, Some(scheme), Some(&GUID_ENERGY_SAVER_SUBGROUP), Some(&GUID_ENERGY_SAVER_THRESHOLD), &mut cur);
+        let target = if on { 100 } else { saved.min(99) };
+        let ok = PowerWriteDCValueIndex(None, scheme, Some(&GUID_ENERGY_SAVER_SUBGROUP), Some(&GUID_ENERGY_SAVER_THRESHOLD), target) == 0
+            && PowerSetActiveScheme(None, Some(scheme)).0 == 0;
+        let _ = windows::Win32::Foundation::LocalFree(HLOCAL(scheme as *mut c_void));
+        if ok { Some(cur) } else { None }
+    }
+}
+
+// ---- Memori (RAM) ----
+/// (terpakai, total) dalam byte
+pub fn memory() -> (u64, u64) {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    unsafe {
+        if GlobalMemoryStatusEx(&mut m).is_ok() { (m.ullTotalPhys - m.ullAvailPhys, m.ullTotalPhys) } else { (0, 0) }
+    }
+}
+
+/// Nama yang lebih mudah dikenali untuk proses yang sering muncul
+fn friendly_process(exe: &str) -> String {
+    let stem = exe.trim_end_matches(".exe").trim_end_matches(".EXE");
+    match stem.to_lowercase().as_str() {
+        "msedgewebview2" => "WebView2 (Edge)".into(),
+        "msmpeng" => "Windows Defender".into(),
+        "svchost" => "Windows services".into(),
+        "code" => "VS Code".into(),
+        "claude" => "Claude".into(),
+        "chrome" => "Chrome".into(),
+        "msedge" => "Edge".into(),
+        "explorer" => "File Explorer".into(),
+        "dwm" => "Desktop Window Manager".into(),
+        "whatsapp.root" => "WhatsApp".into(),
+        "ms-teams" => "Teams".into(),
+        "olk" => "Outlook".into(),
+        _ => {
+            let mut c = stem.chars();
+            match c.next() { Some(f) => f.to_uppercase().collect::<String>() + c.as_str(), None => stem.to_string() }
+        }
+    }
+}
+
+/// Aplikasi dengan pemakaian RAM terbesar (private working set, sama seperti kolom Memory di Task Manager),
+/// digabung per nama program
+pub fn top_processes(n: usize) -> Vec<(String, u64)> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let mut map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return Vec::new() };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                let exe = String::from_utf16_lossy(&e.szExeFile[..len]);
+                if let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, e.th32ProcessID) {
+                    let mut pmc = PROCESS_MEMORY_COUNTERS_EX2 { cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32, ..Default::default() };
+                    if K32GetProcessMemoryInfo(h, &mut pmc as *mut _ as *mut PROCESS_MEMORY_COUNTERS, pmc.cb).as_bool() {
+                        *map.entry(friendly_process(&exe)).or_default() += pmc.PrivateWorkingSetSize as u64;
+                    }
+                    let _ = CloseHandle(h);
+                }
+                if Process32NextW(snap, &mut e).is_err() { break; }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    let mut v: Vec<(String, u64)> = map.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.truncate(n);
+    v
+}
+
 // ---- Menu klik kanan selalu gelap ----
 /// Memakai fungsi uxtheme tanpa nama (ordinal 135 = SetPreferredAppMode, 136 = FlushMenuThemes),
 /// cara yang sama dipakai Explorer untuk menu gelap. Mode 2 = ForceDark (selalu gelap,
