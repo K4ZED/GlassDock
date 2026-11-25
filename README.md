@@ -12,6 +12,12 @@ A lightweight liquid-glass dock that replaces the Windows 11 taskbar, written in
 
 Click the file name to download the installer, then run it. No admin rights are needed, and after this GlassDock updates itself. Older versions and release notes are on the [Releases](https://github.com/K4ZED/GlassDock/releases) page.
 
+## What's new in 1.2
+
+![GlassDock 1.2: Control Center toggles, power card, volume and brightness indicators, glass menu, updates](docs/video/glassdock-1.2-features.gif)
+
+[Watch the full video with sound (37 s)](docs/video/glassdock-1.2.0.mp4)
+
 ## Screenshots
 
 | Control Center | Calendar |
@@ -37,7 +43,7 @@ Click the file name to download the installer, then run it. No admin rights are 
 - Hides the Windows taskbar while running and restores it on exit.
 - **Glass right-click menu** on the dock and its app icons: app actions, Auto-hide and Glass style as segmented buttons that apply right away, a Windows taskbar switch, Check for updates and Quit.
 - Three glass styles (Clear, Frosted, Dark); any remaining Windows menus are forced to dark mode.
-- Small: ~400 KB executable, roughly 15–60 MB of RAM depending on which panels have been used.
+- Small: ~500 KB executable, roughly 15–60 MB of RAM depending on which panels have been used.
 
 ## Install
 
