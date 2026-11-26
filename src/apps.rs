@@ -142,6 +142,25 @@ fn process_aumid(pid: u32) -> Option<String> {
     }
 }
 
+/// AppUserModelID yang ditempel aplikasi di jendelanya sendiri.
+/// Hanya dipakai untuk aplikasi Store / web app yang berjalan di proses lain (mis. Netflix di msedge.exe):
+/// ID profil browser biasa ("Chrome.UserData.Profile1", "MSEdge") diabaikan agar tetap satu ikon dengan browsernya.
+fn window_aumid(h: HWND) -> Option<String> {
+    use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow, PROPERTYKEY};
+    use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
+    unsafe {
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(h).ok()?;
+        // PKEY_AppUserModel_ID
+        let key = PROPERTYKEY { fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3), pid: 5 };
+        let v = store.GetValue(&key).ok()?;
+        let p = PropVariantToStringAlloc(&v).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const c_void));
+        let s = s?;
+        if s.contains('!') || s.contains("_crx_") { Some(s) } else { None }
+    }
+}
+
 unsafe extern "system" fn child_cb(h: HWND, lp: LPARAM) -> BOOL {
     let data = &mut *(lp.0 as *mut (u32, u32));
     let mut pid = 0u32;
@@ -165,7 +184,7 @@ pub fn identify(h: HWND) -> Option<Ident> {
                 path = process_path(pid)?;
             }
         }
-        if let Some(a) = process_aumid(pid) {
+        if let Some(a) = window_aumid(h).or_else(|| process_aumid(pid)) {
             let p = app_pin(&a);
             return Some(Ident { key: p.key, launch: p.launch, icon_src: p.icon_src });
         }

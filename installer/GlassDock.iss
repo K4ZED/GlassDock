@@ -5,7 +5,7 @@
 ; ============================================================
 
 #define AppName "GlassDock"
-#define AppVersion "1.2.0"
+#define AppVersion "1.2.1"
 #define AppPublisher "K4ZED"
 #define AppURL "https://github.com/K4ZED/GlassDock"
 #define AppExe "glassdock.exe"
